@@ -1,0 +1,9 @@
+# Default configuration for Online Causal Tuner node
+online_causal_tuner:
+  ros__parameters:
+    model_path: "./models/causal_tuner_models.pkl"
+    risk_threshold_p_max: 0.15
+    epsilon_exploration: 0.05
+    tuning_rate_hz: 1.0
+    n_candidate_samples: 100
+    dry_run: true
