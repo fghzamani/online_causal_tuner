@@ -154,10 +154,18 @@ def extract_features(rows: list):
         feat_vec = []
         for col in feature_cols:
             val = r.get(col, "0")
-            try:
-                feat_vec.append(float(val) if val != "" else 0.0)
-            except ValueError:
-                feat_vec.append(0.0)
+            if col == "param__local_costmap__footprint":
+                if val == "carry":
+                    feat_vec.append(1.0)
+                elif val == "tucked":
+                    feat_vec.append(0.0)
+                else:
+                    feat_vec.append(0.0)
+            else:
+                try:
+                    feat_vec.append(float(val) if val != "" else 0.0)
+                except ValueError:
+                    feat_vec.append(0.0)
 
         # Safety target: y_h or collision
         y_s = r.get("y_h", r.get("collision", "0"))
