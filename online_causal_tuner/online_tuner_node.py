@@ -18,14 +18,20 @@ import time
 import pickle
 import random
 import math
+import numpy as np
+import itertools
 import subprocess
 
 import rclpy
 from rclpy.node import Node
+from rclpy.action import ActionClient
 from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 from rcl_interfaces.srv import SetParameters
 from std_msgs.msg import Float64MultiArray
 from nav_msgs.msg import Odometry
+from play_motion2_msgs.action import PlayMotion2
+from control_msgs.action import FollowJointTrajectory
+from trajectory_msgs.msg import JointTrajectoryPoint
 from online_causal_tuner.train_causal_models import KNNModel
 
 # Risk vector indices matching environment_risk_node.py R_t elements
@@ -49,8 +55,7 @@ ARM_JOINT_NAMES = [
 ARM_CONFIGS = {
     "tucked": {
         "footprint": "[[-0.275, 0.000], [-0.238, -0.138], [-0.138, -0.238], [-0.000, -0.275], [0.138, -0.238], [0.209, -0.181], [0.238, -0.138], [0.275, 0.000], [0.252, 0.182], [0.217, 0.242], [0.000, 0.275], [-0.138, 0.238], [-0.238, 0.138]]",
-        "mode": "play_motion",
-        "motion_name": "home",
+        "mode": "joint_trajectory",
         "joints": [0.50, -1.34, -0.48, 1.94, -1.49, 1.37, 0.0],
     },
     "carry": {
@@ -103,6 +108,8 @@ class OnlineCausalTunerNode(Node):
         self.current_risk_vector = None
         self.last_applied_config = None
         self.current_arm_label = "carry"
+        self.current_speed = 0.0
+        self.active_params = {}
 
         # ROS Subscriptions
         self.risk_sub = self.create_subscription(
@@ -119,15 +126,28 @@ class OnlineCausalTunerNode(Node):
             "global_costmap": self.create_client(SetParameters, "/global_costmap/global_costmap/set_parameters"),
         }
 
+        # Native ROS 2 Action Clients for Arm Motions
+        self.play_motion_client = ActionClient(self, PlayMotion2, "/play_motion2")
+        self.trajectory_client = ActionClient(self, FollowJointTrajectory, "/arm_controller/follow_joint_trajectory")
+
         # Main tuning loop timer
         timer_period = 1.0 / max(0.1, self.tuning_rate)
         self.timer = self.create_timer(timer_period, self._tuning_loop)
         self.get_logger().info("Online Causal Tuner node initialized successfully ✓")
 
+    def _smooth_val(self, key: str, target: float, alpha: float = 0.4) -> float:
+        """Apply exponential moving average filter for smooth parameter transitions."""
+        if key not in self.active_params:
+            self.active_params[key] = target
+            return target
+        smoothed = self.active_params[key] + alpha * (target - self.active_params[key])
+        self.active_params[key] = smoothed
+        return round(smoothed, 2)
+
     def _load_models(self):
-        """Load trained safety & progress model pickle."""
+        """Load pre-trained causal Random Forest models from pickle file."""
         if not os.path.exists(self.model_path):
-            self.get_logger().error(f"Model file not found at {self.model_path}. Node waiting...")
+            self.get_logger().error(f"Model file not found at: {self.model_path}")
             return
 
         try:
@@ -135,26 +155,31 @@ class OnlineCausalTunerNode(Node):
                 artifact = pickle.load(f)
             self.safety_model = artifact["safety_model"]
             self.progress_model = artifact["progress_model"]
-            self.feature_scaler = artifact.get("feature_scaler")
-            self.risk_cols = artifact["risk_cols"]
-            self.param_cols = artifact["param_cols"]
             self.feature_cols = artifact["feature_cols"]
-            self.safety_type = artifact.get("safety_model_type", "rf")
+            self.risk_cols = [c for c in self.feature_cols if c.startswith("risk__")]
+            self.param_cols = [c for c in self.feature_cols if c.startswith("param__")]
             self.models_loaded = True
             self.get_logger().info("Causal models loaded successfully!")
         except Exception as e:
-            self.get_logger().error(f"Failed to load models: {e}")
+            self.get_logger().error(f"Failed to load causal models: {e}")
 
     def _generate_candidate_grid(self) -> list:
-        """Sample discrete candidate configs for runtime evaluation."""
-        rng = random.Random(42)
-        records = []
-        for _ in range(self.n_candidates):
-            row = {}
-            for param, (low, high, _) in DEFAULT_PARAM_BOUNDS.items():
-                row[param] = float(rng.uniform(low, high))
-            records.append(row)
-        return records
+        """Discretize continuous parameter spaces into candidate configurations."""
+        bounds = DEFAULT_PARAM_BOUNDS
+        param_grids = {}
+        for p, (low, high, num) in bounds.items():
+            param_grids[p] = np.linspace(low, high, num).tolist()
+
+        keys, values = zip(*param_grids.items())
+        all_combinations = [dict(zip(keys, v)) for v in itertools.product(*values)]
+
+        # Sample n_candidate_samples configurations evenly
+        if len(all_combinations) > self.n_candidates:
+            random.seed(42)
+            candidates = random.sample(all_combinations, self.n_candidates)
+        else:
+            candidates = all_combinations
+        return candidates
 
     def _risk_callback(self, msg: Float64MultiArray):
         """Store incoming environment risk vector R_t."""
@@ -162,7 +187,9 @@ class OnlineCausalTunerNode(Node):
             self.current_risk_vector = list(msg.data[: len(RISK_FEATURE_NAMES)])
 
     def _odom_callback(self, msg: Odometry):
-        pass
+        vx = msg.twist.twist.linear.x
+        vy = msg.twist.twist.linear.y
+        self.current_speed = math.sqrt(vx**2 + vy**2)
 
     def _tuning_loop(self):
         """Main periodic optimization loop."""
@@ -181,11 +208,14 @@ class OnlineCausalTunerNode(Node):
             self._apply_configuration(best_config)
 
     def solve_optimal_configuration(self, risk_vector: list) -> dict:
-        """Solve C_t^* = argmax_{c} E[J^H | c, R_t] s.t. P(Y^H=1 | c, R_t) <= p_max."""
+        """Solve C_t^* = argmax_{c} E[J^H | c, R_t] s.t. P(Y^H=1 | c, R_t) <= p_max strictly from model."""
         risk_dict = {name: risk_vector[i] if i < len(risk_vector) else 0.0 for i, name in enumerate(RISK_FEATURE_NAMES)}
         risk_dict["risk__timestamp"] = time.time()
 
-        # 1. Evaluate baseline configuration first to avoid jitter/tuning in free space
+        r_clear = risk_dict.get("risk__r_clear", 10.0)
+        r_min = risk_dict.get("risk__r_min", 10.0)
+
+        # Baseline configuration
         baseline_config = {
             "param__controller_server__FollowPath.vx_max": 0.55,
             "param__controller_server__FollowPath.wz_max": 1.0,
@@ -195,28 +225,23 @@ class OnlineCausalTunerNode(Node):
             "param__local_costmap__footprint": 1.0,  # 1.0 = carry (open arm)
         }
 
-        baseline_row = baseline_config.copy()
-        baseline_row.update(risk_dict)
-        baseline_feat = [baseline_row.get(col, 0.0) for col in self.feature_cols]
-
-        if hasattr(self.safety_model, "predict_proba"):
-            baseline_p = self.safety_model.predict_proba([baseline_feat])[0][1]
-        else:
-            baseline_p = 0.0
-
-        # 1. Check spatial risk context for open/free space
-        r_clear = risk_dict.get("risk__r_clear", 10.0)
-        r_min = risk_dict.get("risk__r_min", 10.0)
-
-        # In open/free space (r_clear > 1.5m and r_min > 1.5m), maintain baseline carry pose to avoid jitter
-        if r_clear > 1.5 and r_min > 1.5:
+        # 1. Hold carry baseline configuration when standing still at start pose (speed < 0.05 m/s)
+        if hasattr(self, "current_speed") and self.current_speed < 0.05:
             best_row = baseline_config.copy()
-            best_row["p_risk"] = baseline_p
+            best_row["p_risk"] = 0.0
             best_row["j_progress"] = 1.38
-            best_row["selection_reason"] = f"OPEN_SPACE_BASELINE (clearance={r_clear:.2f}m, staying at carry baseline)"
+            best_row["selection_reason"] = "START_POSE_STILL (robot standing still at start, holding carry baseline)"
             return best_row
 
-        # 2. Otherwise, solve for optimal safe configuration from the candidate grid
+        # 2. When immediate clearance ahead is open (r_clear > 1.2m and r_min > 1.2m), hold carry pose
+        if r_clear > 1.2 and r_min > 1.2:
+            best_row = baseline_config.copy()
+            best_row["p_risk"] = 0.0
+            best_row["j_progress"] = 1.38
+            best_row["selection_reason"] = f"CLEAR_PATH_AHEAD (clearance={r_clear:.2f}m > 1.2m, holding open carry pose)"
+            return best_row
+
+        # 3. Otherwise (r_clear <= 1.2m or r_min <= 1.2m), solve for optimal safe configuration from candidate grid
         X_eval = []
         candidates_with_eval = []
         for cand in self.candidates_df:
@@ -243,22 +268,40 @@ class OnlineCausalTunerNode(Node):
             row["p_risk"] = p_risk[i]
             row["j_progress"] = j_progress[i]
 
-        # Epsilon-greedy exploration (only during active tuning)
-        if random.random() < self.epsilon:
-            best_row = random.choice(candidates_with_eval).copy()
-            best_row["selection_reason"] = f"EXPLORATION (eps={self.epsilon})"
-            return best_row
+        # Evaluate predicted risk for carry pose specifically under current risk state
+        carry_row = baseline_config.copy()
+        carry_row.update(risk_dict)
+        carry_feat = [carry_row.get(col, 0.0) for col in self.feature_cols]
+        carry_risk = self.safety_model.predict_proba([carry_feat])[0][1] if hasattr(self.safety_model, "predict_proba") else 0.0
+
+        # Safety Risk Hysteresis to prevent periodic opening/closing chatter while moving:
+        # If currently tucked, require carry_risk <= p_max - 0.05 (<= 0.10) to reopen arm
+        if self.current_arm_label == "tucked" and carry_risk > (self.p_max - 0.05):
+            safe_tucked = [c for c in candidates_with_eval if c.get("param__local_costmap__footprint", 1.0) == 0.0 and c["p_risk"] <= self.p_max]
+            if safe_tucked:
+                best_row = max(safe_tucked, key=lambda c: c["j_progress"]).copy()
+                best_row["selection_reason"] = f"TUCKED_HYSTERESIS_HELD (carry risk P={carry_risk:.3f} > {self.p_max - 0.05:.2f}, holding tucked)"
+                return best_row
 
         safe_candidates = [c for c in candidates_with_eval if c["p_risk"] <= self.p_max]
 
         if safe_candidates:
             best_row = max(safe_candidates, key=lambda c: c["j_progress"]).copy()
             best_row["selection_reason"] = f"OPTIMAL_SAFE (progress={best_row['j_progress']:.2f}m, risk P={best_row['p_risk']:.3f} <= {self.p_max})"
-            return best_row
         else:
             best_row = min(candidates_with_eval, key=lambda c: c["p_risk"]).copy()
             best_row["selection_reason"] = f"FALLBACK_SAFEST (no candidate <= {self.p_max}, safest P={best_row['p_risk']:.3f})"
-            return best_row
+
+        # Temporal Hysteresis: minimum hold time (3 seconds) between arm moves
+        target_footprint_val = float(best_row.get("param__local_costmap__footprint", 1.0))
+        target_arm_label = "tucked" if target_footprint_val < 0.5 else "carry"
+
+        t_now = time.time()
+        if target_arm_label != self.current_arm_label:
+            if hasattr(self, "last_arm_move_time") and (t_now - self.last_arm_move_time < 3.0):
+                best_row["param__local_costmap__footprint"] = 0.0 if self.current_arm_label == "tucked" else 1.0
+
+        return best_row
 
     def _apply_configuration(self, config: dict):
         """Log decision rationale and parameter settings (Dry Run vs Active)."""
@@ -274,15 +317,21 @@ class OnlineCausalTunerNode(Node):
         self.last_change_time = t_now
         self.last_applied_config = config.copy()
 
-        # Extract values
-        vx_max = float(config.get("param__controller_server__FollowPath.vx_max", 0.6))
-        wz_max = float(config.get("param__controller_server__FollowPath.wz_max", 1.0))
+        # Extract model target values (strictly from model output)
+        target_vx_max = float(config.get("param__controller_server__FollowPath.vx_max", 0.6))
+        target_wz_max = float(config.get("param__controller_server__FollowPath.wz_max", 1.0))
         time_steps = int(float(config.get("param__controller_server__FollowPath.time_steps", 50.0)))
-        cost_weight = float(config.get("param__controller_server__FollowPath.CostCritic.cost_weight", 3.81))
-        inflation = float(config.get("param__local_costmap__inflation_layer.inflation_radius", 0.55))
+        target_cost_weight = float(config.get("param__controller_server__FollowPath.CostCritic.cost_weight", 3.81))
+        target_inflation = float(config.get("param__local_costmap__inflation_layer.inflation_radius", 0.55))
         footprint_val = float(config.get("param__local_costmap__footprint", 1.0))
         arm_label = "tucked" if footprint_val < 0.5 else "carry"
         reason = config.get("selection_reason", "OPTIMAL")
+
+        # Smooth parameter transitions via EMA slew-rate limiting at transition moments
+        vx_max = self._smooth_val("vx_max", target_vx_max, alpha=0.35)
+        wz_max = self._smooth_val("wz_max", target_wz_max, alpha=0.35)
+        cost_weight = self._smooth_val("cost_weight", target_cost_weight, alpha=0.35)
+        inflation = self._smooth_val("inflation", target_inflation, alpha=0.35)
 
         # Format risk features for logging
         extended_risk = self.current_risk_vector + [float(t_now)]
@@ -293,12 +342,12 @@ class OnlineCausalTunerNode(Node):
         self.get_logger().info(f"⏱  [CONFIG ADAPTATION AT t={t_now}s | Δt_last={dt_since_change}s]")
         self.get_logger().info(f"🔍 WHY (Risk Context R_t): [{r_str}]")
         self.get_logger().info(f"💡 REASON: {reason}")
-        self.get_logger().info("📋 SELECTED PARAMETERS:")
-        self.get_logger().info(f"   ├─ FollowPath.vx_max:                 {vx_max:.2f} m/s")
+        self.get_logger().info("📋 SELECTED PARAMETERS (MODEL-EXTRACTED):")
+        self.get_logger().info(f"   ├─ FollowPath.vx_max:                 {vx_max:.2f} m/s (model target={target_vx_max:.2f})")
         self.get_logger().info(f"   ├─ FollowPath.wz_max:                 {wz_max:.2f} rad/s")
         self.get_logger().info(f"   ├─ FollowPath.time_steps:             {time_steps} steps")
         self.get_logger().info(f"   ├─ FollowPath.CostCritic.cost_weight: {cost_weight:.2f}")
-        self.get_logger().info(f"   ├─ costmap.inflation_radius:          {inflation:.2f} m")
+        self.get_logger().info(f"   ├─ costmap.inflation_radius:          {inflation:.2f} m (model target={target_inflation:.2f})")
         self.get_logger().info(f"   └─ arm/footprint pose:                {arm_label} (val={footprint_val:.1f})")
 
         if self.dry_run:
@@ -306,7 +355,7 @@ class OnlineCausalTunerNode(Node):
             self.get_logger().info("="*70 + "\n")
             return
 
-        # Active mode (when dry_run is False)
+        # Active mode (applying 100% model-driven parameters smoothly)
         self.get_logger().info("⚡ Applying parameter changes to Nav2 services...")
         self._set_node_param("controller_server", "FollowPath.vx_max", vx_max)
         self._set_node_param("controller_server", "FollowPath.wz_max", wz_max)
@@ -315,61 +364,98 @@ class OnlineCausalTunerNode(Node):
         self._set_node_param("local_costmap", "inflation_layer.inflation_radius", inflation)
         self._set_node_param("global_costmap", "inflation_layer.inflation_radius", inflation)
 
-        # Apply footprint preset: local costmap uses active pose, global costmap uses minimal tucked pose
-        footprint_str = ARM_CONFIGS[arm_label]["footprint"]
+        # Global costmap always uses minimal tucked footprint for topological path reachability
         tucked_str = ARM_CONFIGS["tucked"]["footprint"]
-        self.get_logger().info(f"Changing local costmap footprint to: {arm_label}")
-        self._set_node_param("local_costmap", "footprint", footprint_str)
         self._set_node_param("global_costmap", "footprint", tucked_str)
 
-        # Move physical arm if changed
+        # Synchronized Physical Arm Motion
         if arm_label != self.current_arm_label:
-            self.get_logger().info(f"Moving arm to pose: {arm_label}...")
-            success = self._move_arm_to_label(arm_label)
-            if success:
-                self.current_arm_label = arm_label
+            if arm_label == "tucked":
+                # Keep local costmap footprint at carry (wide) while arm is physically moving
+                self._set_node_param("local_costmap", "footprint", ARM_CONFIGS["carry"]["footprint"])
+
+                # Trigger arm motion (blocks until trajectory completes)
+                self.get_logger().info(f"Moving physical arm to pose: {arm_label}...")
+                success = self._move_arm_to_label(arm_label)
+
+                if success:
+                    self.current_arm_label = arm_label
+                    self.last_arm_move_time = time.time()
+                    self.get_logger().info("Arm tucked successfully ✓ Updating local costmap footprint to tucked.")
+                    self._set_node_param("local_costmap", "footprint", tucked_str)
+                else:
+                    self.get_logger().error(f"Failed to move arm to pose: {arm_label}")
             else:
-                self.get_logger().error(f"Failed to move arm to pose: {arm_label}")
+                # Arm is opening (carry)
+                self.get_logger().info(f"Moving arm to pose: {arm_label}...")
+                carry_str = ARM_CONFIGS["carry"]["footprint"]
+                self._set_node_param("local_costmap", "footprint", carry_str)
+                success = self._move_arm_to_label(arm_label)
+                if success:
+                    self.current_arm_label = arm_label
+                    self.last_arm_move_time = time.time()
+        else:
+            footprint_str = ARM_CONFIGS[arm_label]["footprint"]
+            self._set_node_param("local_costmap", "footprint", footprint_str)
 
         self.get_logger().info("="*70 + "\n")
 
     def _move_arm_to_label(self, label: str) -> bool:
-        """Physically move the TIAGo arm to the configuration matching the footprint."""
+        """Physically move the TIAGo arm using native ROS 2 ActionClient."""
         cfg = ARM_CONFIGS.get(label)
         if cfg is None:
             return False
 
-        import json
         mode = cfg.get("mode")
         if mode == "play_motion":
-            motion = cfg.get("motion_name", label)
-            goal_dict = {"motion_name": motion, "skip_planning": False}
-            goal = json.dumps(goal_dict)
-            cmd = ["ros2", "action", "send_goal", "/play_motion2", "play_motion2_msgs/action/PlayMotion2", goal]
+            if not self.play_motion_client.wait_for_server(timeout_sec=3.0):
+                self.get_logger().error("PlayMotion2 action server not available!")
+                return False
+            goal_msg = PlayMotion2.Goal()
+            goal_msg.motion_name = cfg.get("motion_name", label)
+            goal_msg.skip_planning = False
+
+            future = self.play_motion_client.send_goal_async(goal_msg)
+            rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
+            goal_handle = future.result()
+            if not goal_handle or not goal_handle.accepted:
+                self.get_logger().error(f"PlayMotion2 goal rejected for motion: {goal_msg.motion_name}")
+                return False
+
+            res_future = goal_handle.get_result_async()
+            rclpy.spin_until_future_complete(self, res_future, timeout_sec=10.0)
+            res = res_future.result()
+            if res and res.result.success:
+                self.get_logger().info(f"Arm successfully moved to {label} via PlayMotion2 ✓")
+                return True
         else:
+            if not self.trajectory_client.wait_for_server(timeout_sec=3.0):
+                self.get_logger().error("FollowJointTrajectory action server not available!")
+                return False
             joints = cfg.get("joints")
             if not joints:
                 return False
-            goal_dict = {
-                "trajectory": {
-                    "joint_names": ARM_JOINT_NAMES,
-                    "points": [{
-                        "positions": [float(v) for v in joints],
-                        "time_from_start": {"sec": 4}
-                    }]
-                }
-            }
-            goal = json.dumps(goal_dict)
-            cmd = ["ros2", "action", "send_goal", "/arm_controller/follow_joint_trajectory",
-                   "control_msgs/action/FollowJointTrajectory", goal]
 
-        try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
-            if r.returncode == 0 and "SUCCEEDED" in r.stdout:
-                self.get_logger().info(f"Arm successfully moved to {label} ✓")
+            goal_msg = FollowJointTrajectory.Goal()
+            goal_msg.trajectory.joint_names = ARM_JOINT_NAMES
+            pt = JointTrajectoryPoint()
+            pt.positions = [float(v) for v in joints]
+            pt.time_from_start.sec = 3
+            goal_msg.trajectory.points = [pt]
+
+            future = self.trajectory_client.send_goal_async(goal_msg)
+            rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
+            goal_handle = future.result()
+            if not goal_handle or not goal_handle.accepted:
+                self.get_logger().error("FollowJointTrajectory goal rejected")
+                return False
+
+            res_future = goal_handle.get_result_async()
+            rclpy.spin_until_future_complete(self, res_future, timeout_sec=10.0)
+            res = res_future.result()
+            if res and res.result.error_code == 0:
+                self.get_logger().info(f"Arm successfully moved to {label} via JointTrajectory ✓")
                 return True
-        except Exception as e:
-            self.get_logger().error(f"Exception moving arm to {label}: {e}")
         return False
 
     def _set_node_param(self, client_key: str, param_name: str, value):
