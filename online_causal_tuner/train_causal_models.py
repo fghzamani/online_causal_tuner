@@ -34,6 +34,11 @@ RISK_FEATURE_KEYS = [
     "risk__r_ttc",
     "risk__r_width",
     "risk__r_curve",
+    "risk__r_grad",
+    "risk__r_min",
+    "risk__a_t",
+    "risk__r_a_t",
+    "risk__arm_extension",
     "risk__clearance_m",
     "risk__visibility_occluded_fraction",
     "risk__obstacle_density",
@@ -196,27 +201,143 @@ def main():
     rows = load_dataset_csv(args.data_path)
     X, y_safety, y_progress, risk_cols, param_cols, feature_cols = extract_features(rows)
 
-    # Check sklearn availability
-    try:
-        import numpy as np
-        import pandas as pd
-        from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-        from sklearn.metrics import roc_auc_score
+try:
+    import numpy as np
+    import pandas as pd
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.linear_model import LogisticRegression, Ridge
+    from sklearn.base import BaseEstimator, TransformerMixin
+    from sklearn.metrics import roc_auc_score
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
 
-        logger.info("Using Scikit-Learn RandomForest for model training...")
-        X_mat = np.array(X)
-        y_safe_mat = np.array(y_safety)
-        y_prog_mat = np.array(y_progress)
 
-        safety_model = RandomForestClassifier(n_estimators=100, max_depth=8, random_state=42)
-        safety_model.fit(X_mat, y_safe_mat)
+if SKLEARN_AVAILABLE:
+    class CausalInteractionTransformer(BaseEstimator, TransformerMixin):
+        """
+        Constructs interaction terms phi(c) x r matching main.tex Table I.
+        Appends active configuration-risk interaction terms, configuration cross-terms,
+        and dynamic arm actuation lag (a_t) interaction terms.
+        """
+        def __init__(self, feature_cols=None):
+            self.feature_cols = feature_cols or []
 
-        progress_model = RandomForestRegressor(n_estimators=100, max_depth=8, random_state=42)
-        progress_model.fit(X_mat, y_prog_mat)
+        def fit(self, X, y=None):
+            return self
 
-        model_type = "rf"
+        def transform(self, X):
+            X_mat = np.array(X, dtype=np.float64)
+            if not self.feature_cols or X_mat.shape[1] == 0:
+                return X_mat
 
-    except ImportError:
+            col_to_idx = {col: i for i, col in enumerate(self.feature_cols)}
+
+            def get_col(name_substr):
+                for k, idx in col_to_idx.items():
+                    if name_substr in k:
+                        return X_mat[:, idx]
+                return np.zeros(X_mat.shape[0])
+
+            c_v = get_col("vx_max")
+            c_w = get_col("wz_max")
+            c_inf = get_col("inflation_radius")
+            c_obs = get_col("cost_weight")
+            c_hor = get_col("time_horizon")
+            c_arm = get_col("footprint")
+
+            r_ttc = get_col("r_ttc")
+            r_width = get_col("r_width")
+            r_curve = get_col("r_curve")
+            r_clear = get_col("r_clear")
+            r_min = get_col("r_min")
+            r_dens = get_col("r_dens")
+            r_grad = get_col("r_grad")
+            r_vis = get_col("r_vis")
+            r_a_t = get_col("a_t")
+
+            interactions = [
+                c_v * r_ttc,
+                c_v * r_width,
+                c_v * r_curve,
+                c_v * r_clear,
+                c_w * r_clear,
+                c_w * r_curve,
+                c_inf * r_width,
+                c_inf * r_min,
+                c_obs * r_min,
+                c_obs * r_dens,
+                c_obs * r_grad,
+                c_hor * r_ttc,
+                c_hor * r_curve,
+                c_arm * r_vis,
+                c_arm * r_width,
+                c_arm * r_min,
+                c_v * c_hor,
+                c_inf * c_arm,
+                # Dynamic Arm Actuation Lag (a_t in [0, 1]) Interactions
+                c_v * r_a_t,
+                c_arm * r_a_t,
+                r_width * r_a_t,
+            ]
+
+            inter_mat = np.column_stack(interactions)
+            return np.hstack([X_mat, inter_mat])
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Train Causal Models for Online Tuner")
+    parser.add_argument("--data-path", type=str, required=True, help="Path to Campaign A rct_results.csv")
+    parser.add_argument("--output-dir", type=str, default="./models", help="Output directory for trained models")
+    args = parser.parse_args()
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    rows = load_dataset_csv(args.data_path)
+    X, y_safety, y_progress, risk_cols, param_cols, feature_cols = extract_features(rows)
+
+    if SKLEARN_AVAILABLE:
+        logger.info("Fitting Causal Parametric Models (main.tex formulation)...")
+        X_mat = np.array(X, dtype=np.float64)
+
+        y_safe_mat = np.array(y_safety, dtype=np.int32)
+        y_prog_mat = np.array(y_progress, dtype=np.float64)
+
+        # =====================================================================
+        # RANDOM FOREST IMPLEMENTATION (COMMENTED OUT AS REQUESTED)
+        # =====================================================================
+        # from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+        # logger.info("Using Scikit-Learn RandomForest for model training...")
+        # safety_model = RandomForestClassifier(n_estimators=100, max_depth=8, random_state=42)
+        # safety_model.fit(X_mat, y_safe_mat)
+        # progress_model = RandomForestRegressor(n_estimators=100, max_depth=8, random_state=42)
+        # progress_model.fit(X_mat, y_prog_mat)
+        # model_type = "rf"
+        # =====================================================================
+
+        # Causal Model 1: Logistic Regression for Safety P(Y^H = 1 | do(C=c), R_t=r)
+        transformer = CausalInteractionTransformer(feature_cols=feature_cols)
+        safety_pipeline = Pipeline([
+            ("interaction", transformer),
+            ("scaler", StandardScaler()),
+            ("classifier", LogisticRegression(max_iter=1000, C=1.0, solver="lbfgs", random_state=42))
+        ])
+        safety_pipeline.fit(X_mat, y_safe_mat)
+        safety_model = safety_pipeline
+
+        # Causal Model 2: Ridge Linear Regression for Progress E[J^H | do(C=c), R_t=r]
+        progress_pipeline = Pipeline([
+            ("interaction", transformer),
+            ("scaler", StandardScaler()),
+            ("regressor", Ridge(alpha=1.0, random_state=42))
+        ])
+        progress_pipeline.fit(X_mat, y_prog_mat)
+        progress_model = progress_pipeline
+
+        model_type = "causal_logistic_ridge"
+        logger.info("Successfully trained Causal Logistic & Ridge Regression models with sparse interaction terms ✓")
+
+    else:
         logger.info("Scikit-Learn not found in environment; using KNNModel fallback...")
         safety_model = KNNModel(k=5, is_classifier=True)
         safety_model.fit(X, y_safety)
@@ -246,3 +367,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

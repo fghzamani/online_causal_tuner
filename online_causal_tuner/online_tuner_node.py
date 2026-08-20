@@ -14,11 +14,14 @@ Usage:
 
 import os
 import sys
+import argparse
 import time
+import math
 import pickle
 import random
-import math
+import json
 import numpy as np
+import pandas as pd
 import itertools
 import subprocess
 
@@ -29,10 +32,15 @@ from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 from rcl_interfaces.srv import SetParameters
 from std_msgs.msg import Float64MultiArray
 from nav_msgs.msg import Odometry
-from play_motion2_msgs.action import PlayMotion2
 from control_msgs.action import FollowJointTrajectory
 from trajectory_msgs.msg import JointTrajectoryPoint
+from geometry_msgs.msg import PolygonStamped, Point32
 from online_causal_tuner.train_causal_models import KNNModel
+
+try:
+    from play_motion2_msgs.action import PlayMotion2
+except ImportError:
+    PlayMotion2 = None
 
 # Risk vector indices matching environment_risk_node.py R_t elements
 RISK_FEATURE_NAMES = [
@@ -44,6 +52,7 @@ RISK_FEATURE_NAMES = [
     "risk__r_curve",
     "risk__r_grad",
     "risk__r_vis",
+    "risk__a_t",
 ]
 
 # TIAGo Arm joints & footprint configs mapping
@@ -55,12 +64,14 @@ ARM_JOINT_NAMES = [
 ARM_CONFIGS = {
     "tucked": {
         "footprint": "[[-0.275, 0.000], [-0.238, -0.138], [-0.138, -0.238], [-0.000, -0.275], [0.138, -0.238], [0.209, -0.181], [0.238, -0.138], [0.275, 0.000], [0.252, 0.182], [0.217, 0.242], [0.000, 0.275], [-0.138, 0.238], [-0.238, 0.138]]",
-        "mode": "joint_trajectory",
+        "mode": "play_motion",
+        "motion_name": "home",
         "joints": [0.50, -1.34, -0.48, 1.94, -1.49, 1.37, 0.0],
     },
     "carry": {
         "footprint": "[[-0.275, 0.000], [-0.238, -0.138], [0.070, -0.476], [0.230, -0.641], [0.420, -0.698], [0.480, -0.698], [0.510, -0.646], [0.238, 0.138], [0.138, 0.238], [0.000, 0.275], [-0.138, 0.238], [-0.238, 0.138]]",
-        "mode": "joint_trajectory",
+        "mode": "play_motion",
+        "motion_name": "carry",
         "joints": [0.0, 0.15, -0.5, 1.2, 0.0, 0.8, 0.0],
     },
 }
@@ -86,7 +97,7 @@ class OnlineCausalTunerNode(Node):
         self.declare_parameter("epsilon_exploration", 0.05)
         self.declare_parameter("tuning_rate_hz", 1.0)
         self.declare_parameter("n_candidate_samples", 100)
-        self.declare_parameter("dry_run", True)  # Dry-run mode: print parameters without applying
+        self.declare_parameter("dry_run", False)  # Active mode by default: apply parameters live
 
         self.model_path = self.get_parameter("model_path").get_parameter_value().string_value
         self.p_max = self.get_parameter("risk_threshold_p_max").get_parameter_value().double_value
@@ -130,10 +141,32 @@ class OnlineCausalTunerNode(Node):
         self.play_motion_client = ActionClient(self, PlayMotion2, "/play_motion2")
         self.trajectory_client = ActionClient(self, FollowJointTrajectory, "/arm_controller/follow_joint_trajectory")
 
+        # Footprint Publishers for immediate RViz visualization sync
+        self.local_footprint_pub = self.create_publisher(PolygonStamped, "/local_costmap/published_footprint", 10)
+        self.footprint_pub = self.create_publisher(PolygonStamped, "/footprint", 10)
+
         # Main tuning loop timer
         timer_period = 1.0 / max(0.1, self.tuning_rate)
         self.timer = self.create_timer(timer_period, self._tuning_loop)
-        self.get_logger().info("Online Causal Tuner node initialized successfully ✓")
+        self.get_logger().info("Online Causal Tuner node initialized successfully.")
+
+    def _publish_footprint_polygon(self, footprint_str: str):
+        """Publish PolygonStamped to /local_costmap/published_footprint and /footprint for RViz visual sync."""
+        try:
+            pts = json.loads(footprint_str)
+            poly_msg = PolygonStamped()
+            poly_msg.header.stamp = self.get_clock().now().to_msg()
+            poly_msg.header.frame_id = "base_link"
+            for pt in pts:
+                p = Point32()
+                p.x = float(pt[0])
+                p.y = float(pt[1])
+                p.z = 0.0
+                poly_msg.polygon.points.append(p)
+            self.local_footprint_pub.publish(poly_msg)
+            self.footprint_pub.publish(poly_msg)
+        except Exception as e:
+            self.get_logger().error(f"Error publishing footprint polygon: {e}")
 
     def _smooth_val(self, key: str, target: float, alpha: float = 0.4) -> float:
         """Apply exponential moving average filter for smooth parameter transitions."""
@@ -192,7 +225,7 @@ class OnlineCausalTunerNode(Node):
         self.current_speed = math.sqrt(vx**2 + vy**2)
 
     def _tuning_loop(self):
-        """Main periodic optimization loop."""
+        """Main periodic optimization loop with latency breakdown instrumentation."""
         if not self.models_loaded:
             self._load_models()
             if not self.models_loaded:
@@ -202,13 +235,29 @@ class OnlineCausalTunerNode(Node):
             self.get_logger().warn("Waiting for /risk_state message...", throttle_duration_sec=5.0)
             return
 
+        t_start = time.perf_counter()
+        
         # Solve optimal configuration
         best_config = self.solve_optimal_configuration(self.current_risk_vector)
+        
+        t_solve = (time.perf_counter() - t_start) * 1000.0  # ms
+        
         if best_config is not None:
+            t_apply_start = time.perf_counter()
             self._apply_configuration(best_config)
+            t_apply = (time.perf_counter() - t_apply_start) * 1000.0
+            t_total = (time.perf_counter() - t_start) * 1000.0
+            
+            # Diagnostic timing breakdown log (Gap 4 telemetry)
+            t_infer = best_config.get("t_infer_ms", 0.0)
+            t_select = best_config.get("t_select_ms", 0.0)
+            self.get_logger().debug(
+                f"LATENCY_BREAKDOWN [ms]: total={t_total:.2f} | infer={t_infer:.2f} | select={t_select:.2f} | apply={t_apply:.2f}"
+            )
 
     def solve_optimal_configuration(self, risk_vector: list) -> dict:
         """Solve C_t^* = argmax_{c} E[J^H | c, R_t] s.t. P(Y^H=1 | c, R_t) <= p_max strictly from model."""
+        t_solve_start = time.perf_counter()
         risk_dict = {name: risk_vector[i] if i < len(risk_vector) else 0.0 for i, name in enumerate(RISK_FEATURE_NAMES)}
         risk_dict["risk__timestamp"] = time.time()
 
@@ -231,6 +280,8 @@ class OnlineCausalTunerNode(Node):
             best_row["p_risk"] = 0.0
             best_row["j_progress"] = 1.38
             best_row["selection_reason"] = "START_POSE_STILL (robot standing still at start, holding carry baseline)"
+            best_row["t_infer_ms"] = 0.0
+            best_row["t_select_ms"] = (time.perf_counter() - t_solve_start) * 1000.0
             return best_row
 
         # 2. When immediate clearance ahead is open (r_clear > 1.2m and r_min > 1.2m), hold carry pose
@@ -239,9 +290,12 @@ class OnlineCausalTunerNode(Node):
             best_row["p_risk"] = 0.0
             best_row["j_progress"] = 1.38
             best_row["selection_reason"] = f"CLEAR_PATH_AHEAD (clearance={r_clear:.2f}m > 1.2m, holding open carry pose)"
+            best_row["t_infer_ms"] = 0.0
+            best_row["t_select_ms"] = (time.perf_counter() - t_solve_start) * 1000.0
             return best_row
 
         # 3. Otherwise (r_clear <= 1.2m or r_min <= 1.2m), solve for optimal safe configuration from candidate grid
+        t_infer_start = time.perf_counter()
         X_eval = []
         candidates_with_eval = []
         for cand in self.candidates_df:
@@ -268,6 +322,10 @@ class OnlineCausalTunerNode(Node):
             row["p_risk"] = p_risk[i]
             row["j_progress"] = j_progress[i]
 
+        # Record model inference timing
+        t_infer_ms = (time.perf_counter() - t_infer_start) * 1000.0
+        t_select_start = time.perf_counter()
+
         # Evaluate predicted risk for carry pose specifically under current risk state
         carry_row = baseline_config.copy()
         carry_row.update(risk_dict)
@@ -281,6 +339,8 @@ class OnlineCausalTunerNode(Node):
             if safe_tucked:
                 best_row = max(safe_tucked, key=lambda c: c["j_progress"]).copy()
                 best_row["selection_reason"] = f"TUCKED_HYSTERESIS_HELD (carry risk P={carry_risk:.3f} > {self.p_max - 0.05:.2f}, holding tucked)"
+                best_row["t_infer_ms"] = t_infer_ms
+                best_row["t_select_ms"] = (time.perf_counter() - t_select_start) * 1000.0
                 return best_row
 
         safe_candidates = [c for c in candidates_with_eval if c["p_risk"] <= self.p_max]
@@ -301,6 +361,8 @@ class OnlineCausalTunerNode(Node):
             if hasattr(self, "last_arm_move_time") and (t_now - self.last_arm_move_time < 3.0):
                 best_row["param__local_costmap__footprint"] = 0.0 if self.current_arm_label == "tucked" else 1.0
 
+        best_row["t_infer_ms"] = t_infer_ms
+        best_row["t_select_ms"] = (time.perf_counter() - t_select_start) * 1000.0
         return best_row
 
     def _apply_configuration(self, config: dict):
@@ -337,13 +399,64 @@ class OnlineCausalTunerNode(Node):
         extended_risk = self.current_risk_vector + [float(t_now)]
         r_str = ", ".join([f"{name.split('__')[-1]}={val:.2f}" for name, val in zip(self.risk_cols, extended_risk)])
 
-        # Print decision tracking report
-        self.get_logger().info("\n" + "="*70)
-        self.get_logger().info(f"⏱  [CONFIG ADAPTATION AT t={t_now}s | Δt_last={dt_since_change}s]")
-        self.get_logger().info(f"🔍 WHY (Risk Context R_t): [{r_str}]")
-        self.get_logger().info(f"💡 REASON: {reason}")
-        self.get_logger().info("📋 SELECTED PARAMETERS (MODEL-EXTRACTED):")
-        self.get_logger().info(f"   ├─ FollowPath.vx_max:                 {vx_max:.2f} m/s (model target={target_vx_max:.2f})")
+        # Safety Hysteresis Bound
+        valid_candidates = []
+        for i, row in self.candidates_df.iterrows():
+            p_i = p_risk[i]
+            j_i = j_progress[i]
+            arm_val = row["param__local_costmap__footprint"]
+
+            # If arm is tucked, reopening to carry requires lower risk threshold (p_max - 0.05)
+            if self.current_arm_label == "tucked" and arm_val == 1.0:
+                if p_i <= (self.p_max - 0.05):
+                    valid_candidates.append((i, p_i, j_i))
+            else:
+                if p_i <= self.p_max:
+                    valid_candidates.append((i, p_i, j_i))
+
+        # Epsilon-Greedy Exploration or Progress Maximization
+        if valid_candidates:
+            if random.random() < self.epsilon:
+                best_idx, _, _ = random.choice(valid_candidates)
+            else:
+                valid_candidates.sort(key=lambda x: x[2], reverse=True)  # Maximize progress J^H
+                best_idx = valid_candidates[0][0]
+        else:
+            # Safest Fallback: Minimum Risk Candidate
+            best_idx = int(np.argmin(p_risk))
+            self.get_logger().warn(f"No candidate satisfies p_max <= {self.p_max:.2f}! Using safest fallback (p_risk={p_risk[best_idx]:.3f})")
+
+        selected_row = self.candidates_df.iloc[best_idx].to_dict()
+        self._apply_configuration(selected_row)
+
+    def _get_risk_feature_index(self, col_name: str, n_risk: int) -> int:
+        """Map feature column name to risk vector index."""
+        if "min" in col_name or "clearance" in col_name: return 0
+        if "width" in col_name or "corridor" in col_name: return 1
+        if "ttc" in col_name: return 2
+        if "dens" in col_name or "density" in col_name: return 3
+        if "clear" in col_name: return 4
+        if "curve" in col_name or "curvature" in col_name: return 5
+        if "grad" in col_name: return 6
+        if "vis" in col_name or "occluded" in col_name: return 7
+        if "a_t" in col_name or "arm" in col_name: return 8
+        return 0
+
+    def _apply_configuration(self, target_config: dict):
+        """Apply smoothed parameters and synchronized arm state to Nav2 services."""
+        vx_max = self._smooth_val("vx_max", float(target_config["param__controller_server__FollowPath.vx_max"]))
+        wz_max = self._smooth_val("wz_max", float(target_config["param__controller_server__FollowPath.wz_max"]))
+        time_steps = float(target_config["param__controller_server__FollowPath.time_steps"])
+        cost_weight = self._smooth_val("cost_weight", float(target_config["param__controller_server__FollowPath.CostCritic.cost_weight"]))
+        target_inflation = float(target_config["param__local_costmap__inflation_layer.inflation_radius"])
+        inflation = self._smooth_val("inflation_radius", target_inflation)
+
+        footprint_val = float(target_config["param__local_costmap__footprint"])
+        arm_label = "carry" if footprint_val >= 0.5 else "tucked"
+
+        self.get_logger().info("="*70)
+        self.get_logger().info(f"[ONLINE TUNER DECISION LOOP] Speed={self.current_speed:.2f} m/s")
+        self.get_logger().info(f"   ├─ FollowPath.vx_max:                 {vx_max:.2f} m/s")
         self.get_logger().info(f"   ├─ FollowPath.wz_max:                 {wz_max:.2f} rad/s")
         self.get_logger().info(f"   ├─ FollowPath.time_steps:             {time_steps} steps")
         self.get_logger().info(f"   ├─ FollowPath.CostCritic.cost_weight: {cost_weight:.2f}")
@@ -351,12 +464,12 @@ class OnlineCausalTunerNode(Node):
         self.get_logger().info(f"   └─ arm/footprint pose:                {arm_label} (val={footprint_val:.1f})")
 
         if self.dry_run:
-            self.get_logger().info("🚫 [DRY-RUN MODE ACTIVE]: Parameter service calls are BYPASSED.")
+            self.get_logger().info("[DRY-RUN MODE ACTIVE]: Parameter service calls are BYPASSED.")
             self.get_logger().info("="*70 + "\n")
             return
 
-        # Active mode (applying 100% model-driven parameters smoothly)
-        self.get_logger().info("⚡ Applying parameter changes to Nav2 services...")
+        # Active mode (applying parameters live)
+        self.get_logger().info("Applying parameter changes to Nav2 services...")
         self._set_node_param("controller_server", "FollowPath.vx_max", vx_max)
         self._set_node_param("controller_server", "FollowPath.wz_max", wz_max)
         self._set_node_param("controller_server", "FollowPath.time_steps", time_steps)
@@ -364,105 +477,89 @@ class OnlineCausalTunerNode(Node):
         self._set_node_param("local_costmap", "inflation_layer.inflation_radius", inflation)
         self._set_node_param("global_costmap", "inflation_layer.inflation_radius", inflation)
 
-        # Global costmap always uses minimal tucked footprint for topological path reachability
-        tucked_str = ARM_CONFIGS["tucked"]["footprint"]
-        self._set_node_param("global_costmap", "footprint", tucked_str)
+        target_footprint = ARM_CONFIGS[arm_label]["footprint"]
 
-        # Synchronized Physical Arm Motion
+        # Synchronized Physical Arm Motion & Footprint Update
         if arm_label != self.current_arm_label:
             if arm_label == "tucked":
-                # Keep local costmap footprint at carry (wide) while arm is physically moving
-                self._set_node_param("local_costmap", "footprint", ARM_CONFIGS["carry"]["footprint"])
-
-                # Trigger arm motion (blocks until trajectory completes)
-                self.get_logger().info(f"Moving physical arm to pose: {arm_label}...")
-                success = self._move_arm_to_label(arm_label)
-
-                if success:
-                    self.current_arm_label = arm_label
-                    self.last_arm_move_time = time.time()
-                    self.get_logger().info("Arm tucked successfully ✓ Updating local costmap footprint to tucked.")
-                    self._set_node_param("local_costmap", "footprint", tucked_str)
-                else:
-                    self.get_logger().error(f"Failed to move arm to pose: {arm_label}")
+                self.get_logger().info(f"Transitioning physical arm to tucked pose...")
+                success = self._move_arm_to_label("tucked")
+                self.current_arm_label = "tucked"
+                self.last_arm_move_time = time.time()
+                self._set_node_param("local_costmap", "footprint", target_footprint)
+                self._publish_footprint_polygon(target_footprint)
             else:
-                # Arm is opening (carry)
-                self.get_logger().info(f"Moving arm to pose: {arm_label}...")
-                carry_str = ARM_CONFIGS["carry"]["footprint"]
-                self._set_node_param("local_costmap", "footprint", carry_str)
-                success = self._move_arm_to_label(arm_label)
-                if success:
-                    self.current_arm_label = arm_label
-                    self.last_arm_move_time = time.time()
+                self.get_logger().info(f"Transitioning physical arm to carry pose...")
+                self._set_node_param("local_costmap", "footprint", target_footprint)
+                self._publish_footprint_polygon(target_footprint)
+                success = self._move_arm_to_label("carry")
+                self.current_arm_label = "carry"
+                self.last_arm_move_time = time.time()
         else:
-            footprint_str = ARM_CONFIGS[arm_label]["footprint"]
-            self._set_node_param("local_costmap", "footprint", footprint_str)
+            self._set_node_param("local_costmap", "footprint", target_footprint)
+            self._publish_footprint_polygon(target_footprint)
 
         self.get_logger().info("="*70 + "\n")
 
     def _move_arm_to_label(self, label: str) -> bool:
-        """Physically move the TIAGo arm using native ROS 2 ActionClient."""
+        """Physically move the TIAGo arm using PlayMotion2 or FollowJointTrajectory fallback."""
         cfg = ARM_CONFIGS.get(label)
         if cfg is None:
             return False
 
-        mode = cfg.get("mode")
-        if mode == "play_motion":
-            if not self.play_motion_client.wait_for_server(timeout_sec=3.0):
-                self.get_logger().error("PlayMotion2 action server not available!")
-                return False
+        # Try PlayMotion2 first
+        if PlayMotion2 is not None and self.play_motion_client.wait_for_server(timeout_sec=2.0):
+            motion_name = cfg.get("motion_name", label)
+            self.get_logger().info(f"Sending PlayMotion2 goal '{motion_name}'...")
             goal_msg = PlayMotion2.Goal()
-            goal_msg.motion_name = cfg.get("motion_name", label)
+            goal_msg.motion_name = motion_name
             goal_msg.skip_planning = False
 
             future = self.play_motion_client.send_goal_async(goal_msg)
-            rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
+            rclpy.spin_until_future_complete(self, future, timeout_sec=3.0)
             goal_handle = future.result()
-            if not goal_handle or not goal_handle.accepted:
-                self.get_logger().error(f"PlayMotion2 goal rejected for motion: {goal_msg.motion_name}")
-                return False
+            if goal_handle and goal_handle.accepted:
+                res_future = goal_handle.get_result_async()
+                rclpy.spin_until_future_complete(self, res_future, timeout_sec=8.0)
+                res = res_future.result()
+                if res and getattr(res.result, 'success', True):
+                    self.get_logger().info(f"Arm moved to {label} via PlayMotion2.")
+                    return True
 
-            res_future = goal_handle.get_result_async()
-            rclpy.spin_until_future_complete(self, res_future, timeout_sec=10.0)
-            res = res_future.result()
-            if res and res.result.success:
-                self.get_logger().info(f"Arm successfully moved to {label} via PlayMotion2 ✓")
-                return True
-        else:
-            if not self.trajectory_client.wait_for_server(timeout_sec=3.0):
-                self.get_logger().error("FollowJointTrajectory action server not available!")
-                return False
+        # Fallback to FollowJointTrajectory
+        if self.trajectory_client.wait_for_server(timeout_sec=2.0):
             joints = cfg.get("joints")
-            if not joints:
-                return False
+            if joints:
+                self.get_logger().info(f"Sending FollowJointTrajectory goal for {label}...")
+                goal_msg = FollowJointTrajectory.Goal()
+                goal_msg.trajectory.joint_names = ARM_JOINT_NAMES
+                pt = JointTrajectoryPoint()
+                pt.positions = [float(v) for v in joints]
+                pt.time_from_start.sec = 3
+                goal_msg.trajectory.points = [pt]
 
-            goal_msg = FollowJointTrajectory.Goal()
-            goal_msg.trajectory.joint_names = ARM_JOINT_NAMES
-            pt = JointTrajectoryPoint()
-            pt.positions = [float(v) for v in joints]
-            pt.time_from_start.sec = 3
-            goal_msg.trajectory.points = [pt]
-
-            future = self.trajectory_client.send_goal_async(goal_msg)
-            rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
-            goal_handle = future.result()
-            if not goal_handle or not goal_handle.accepted:
-                self.get_logger().error("FollowJointTrajectory goal rejected")
-                return False
-
-            res_future = goal_handle.get_result_async()
-            rclpy.spin_until_future_complete(self, res_future, timeout_sec=10.0)
-            res = res_future.result()
-            if res and res.result.error_code == 0:
-                self.get_logger().info(f"Arm successfully moved to {label} via JointTrajectory ✓")
-                return True
+                future = self.trajectory_client.send_goal_async(goal_msg)
+                rclpy.spin_until_future_complete(self, future, timeout_sec=3.0)
+                goal_handle = future.result()
+                if goal_handle and goal_handle.accepted:
+                    res_future = goal_handle.get_result_async()
+                    rclpy.spin_until_future_complete(self, res_future, timeout_sec=8.0)
+                    res = res_future.result()
+                    if res and getattr(res.result, 'error_code', 0) == 0:
+                        self.get_logger().info(f"Arm moved to {label} via JointTrajectory.")
+                        return True
         return False
 
     def _set_node_param(self, client_key: str, param_name: str, value):
-        """Asynchronously call ROS 2 parameter service."""
+        """Call ROS 2 parameter service with wait and logging."""
         client = self.param_clients.get(client_key)
-        if client is None or not client.service_is_ready():
+        if client is None:
             return
+
+        if not client.service_is_ready():
+            if not client.wait_for_service(timeout_sec=1.0):
+                self.get_logger().warn(f"Parameter service '{client_key}' not ready; skipping '{param_name}'")
+                return
 
         req = SetParameters.Request()
         param_msg = Parameter()
@@ -476,6 +573,7 @@ class OnlineCausalTunerNode(Node):
         req.parameters.append(param_msg)
 
         client.call_async(req)
+        self.get_logger().info(f"   Parameter set {client_key}.{param_name} = {str(value)[:45]}...")
 
 
 def main(args=None):
