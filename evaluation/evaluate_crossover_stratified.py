@@ -152,15 +152,18 @@ def evaluate_crossover(data_path: str, output_dir: str):
     ax.grid(True, linestyle="--", alpha=0.5)
 
     plt.tight_layout()
-    fig_pdf = os.path.join(output_dir, "fig_crossover_forest_plot.pdf")
-    fig_png = os.path.join(output_dir, "fig_crossover_forest_plot.png")
+    paper_art_dir = "paper_artifacts"
+    os.makedirs(paper_art_dir, exist_ok=True)
+
+    fig_pdf = os.path.join(paper_art_dir, "fig_crossover_forest_plot.pdf")
+    fig_png = os.path.join(paper_art_dir, "fig_crossover_forest_plot.png")
     plt.savefig(fig_pdf, dpi=300)
     plt.savefig(fig_png, dpi=300)
     plt.close()
     logger.info(f"Saved crossover forest plots to {fig_pdf} and {fig_png} ✓")
 
     # Save LaTeX Table
-    tex_path = os.path.join(output_dir, "table_crossover_stratified.tex")
+    tex_path = os.path.join(paper_art_dir, "table_crossover_stratified.tex")
     with open(tex_path, "w", encoding="utf-8") as f:
         f.write("% Formatted LaTeX Table III for main.tex\n")
         f.write("\\begin{table}[t]\n")

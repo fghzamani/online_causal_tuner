@@ -90,8 +90,11 @@ def evaluate_competing_risks(data_path: str, output_dir: str):
     print(f"🚨 Safety Bias Distortion (False Safety Error):    {bias_distortion_pct:.1f}%")
     print("="*85 + "\n")
 
+    paper_art_dir = "paper_artifacts"
+    os.makedirs(paper_art_dir, exist_ok=True)
+
     # Save LaTeX Table IV
-    tex_path_1 = os.path.join(output_dir, "table_competing_risks_ablation.tex")
+    tex_path_1 = os.path.join(paper_art_dir, "table_competing_risks_ablation.tex")
     with open(tex_path_1, "w", encoding="utf-8") as f:
         f.write("% Formatted LaTeX Table IV for main.tex\n")
         f.write("\\begin{table}[t]\n")
@@ -140,7 +143,7 @@ def evaluate_competing_risks(data_path: str, output_dir: str):
     print("="*85 + "\n")
 
     # Save LaTeX Table V
-    tex_path_2 = os.path.join(output_dir, "table_envelope_ablation.tex")
+    tex_path_2 = os.path.join(paper_art_dir, "table_envelope_ablation.tex")
     with open(tex_path_2, "w", encoding="utf-8") as f:
         f.write("% Formatted LaTeX Table V for main.tex\n")
         f.write("\\begin{table}[t]\n")

@@ -304,15 +304,18 @@ def evaluate_data_efficiency(data_path: str, output_dir: str, n_repeats: int = 5
     axs[1, 1].legend()
 
     plt.tight_layout()
-    fig_pdf = os.path.join(output_dir, "fig_data_efficiency_curves.pdf")
-    fig_png = os.path.join(output_dir, "fig_data_efficiency_curves.png")
+    paper_art_dir = "paper_artifacts"
+    os.makedirs(paper_art_dir, exist_ok=True)
+
+    fig_pdf = os.path.join(paper_art_dir, "fig_data_efficiency_curves.pdf")
+    fig_png = os.path.join(paper_art_dir, "fig_data_efficiency_curves.png")
     plt.savefig(fig_pdf, dpi=300)
     plt.savefig(fig_png, dpi=300)
     plt.close()
     logger.info(f"Saved publication figures to {fig_pdf} and {fig_png} ✓")
 
     # Save LaTeX Table
-    tex_path = os.path.join(output_dir, "table_data_efficiency.tex")
+    tex_path = os.path.join(paper_art_dir, "table_data_efficiency.tex")
     with open(tex_path, "w", encoding="utf-8") as f:
         f.write("% Formatted LaTeX Table V for main.tex\n")
         f.write("\\begin{table}[t]\n")
