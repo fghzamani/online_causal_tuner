@@ -1,0 +1,20 @@
+% =============================================================================
+% FORMATTED LATEX TABLE V AND PUBLICATION ANALYSIS FOR MAIN.TEX (SECTION V-D2)
+% =============================================================================
+
+\begin{table}[t]
+\centering
+\caption{Physical Body Envelope Adaptation Ablation in narrow channels ($R^{\text{width}} \le 3.82\text{m}$).}
+\label{tab:envelope_ablation}
+\footnotesize
+\begin{tabularx}{\columnwidth}{@{}X c c c@{}}
+\toprule
+\textbf{Tuning Strategy} & \textbf{Arm Envelope} & \textbf{Narrow Failure Rate $\downarrow$} & \textbf{Relative Safety Gain} \\
+\midrule
+Software-Only Tuning & Fixed Carry & 7.08\% & Baseline \\
+Combined Causal Tuner & Dynamic Tucked & 0.95\% & +86.5\% \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+To isolate the contribution of joint software-hardware parameter tuning, we evaluate an ablation comparing software-only parameter adaptation (tuning $v_{\max}, w_{\max}, r_{\inf}, \text{cost\_weight}$ with a fixed extended carry arm envelope) against our combined framework (which dynamically retracts the physical arm envelope $C^{\text{arm}} \to \text{tucked}$). In narrow channels ($R^{\text{width}} \le 3.82\text{m}$), software-only tuning suffers a high failure rate of $7.08\%$ because velocity and inflation adjustments cannot physically shrink the robot's geometric collision footprint. Dynamically retracting the physical arm to tucked pose reduces narrow channel failure rate to $0.95\%$, achieving an $86.5\%$ relative safety improvement. This confirms that physical envelope adaptation is necessary to complement software parameter tuning in tight spaces.

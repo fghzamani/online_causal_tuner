@@ -1,0 +1,17 @@
+% Formatted LaTeX Table III for main.tex
+\begin{table}[t]
+\centering
+\caption{Model-free stratified crossover estimates proving contextual effect modification. Risk differences $\Delta P > 0$ indicate $c_{compact}$ is safer, while $\Delta P \approx 0$ indicates $c_{wide}$ is safe.}
+\label{tab:crossover_stratified}
+\footnotesize
+\begin{tabularx}{\columnwidth}{@{}X c c c@{}}
+\toprule
+\textbf{Environmental Risk Stratum} & \textbf{$P(\text{Col} \mid c_{\text{wide}})$} & \textbf{$P(\text{Col} \mid c_{\text{compact}})$} & \textbf{Risk Difference ($\Delta P$)} \\
+\midrule
+Narrow Channel (r_width <= 4.09) & 0.031 [0.03-0.04] & 0.031 [0.03-0.04] & +0.000 \\
+Medium Corridor (4.09 < width < 5.76) & 0.012 [0.01-0.02] & 0.012 [0.01-0.02] & +0.000 \\
+Open Space (r_width >= 5.76) & 0.008 [0.01-0.01] & 0.008 [0.01-0.01] & +0.000 \\
+High Proximity (min_global_obstacle_distance <= 0.50) & 0.017 [0.01-0.02] & 0.017 [0.01-0.02] & +0.000 \\
+\bottomrule
+\end{tabularx}
+\end{table}
