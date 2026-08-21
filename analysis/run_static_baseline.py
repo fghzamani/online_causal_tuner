@@ -66,7 +66,7 @@ def run_static_baseline(strategy_name: str, config_yaml: str, num_episodes: int,
 
     for ep_id in range(1, num_episodes + 1):
         logger.info(f"\n--- Episode {ep_id}/{num_episodes} | Strategy: '{strategy_name}' ---")
-        start_pose, goal_pose = pose_sampler.sample_pose_pair()
+        start_pose, goal_pose = pose_sampler.sample_start_goal()
 
         trial_id = f"ep{ep_id}_{strategy_name.replace(' ', '_')}"
         res = runner.run_trial(
