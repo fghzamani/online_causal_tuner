@@ -113,14 +113,9 @@ def evaluate_crossover(data_path: str, output_dir: str):
         f"High Proximity ({r_min_col.split('__')[-1]} <= {r_min_q33:.2f})": r_min_num <= r_min_q33,
     }
 
-    # c_wide: Carry arm (open envelope) OR Fast speed (> median)
-    # c_compact: Tucked arm (minimal envelope) OR Slow speed (<= median)
-    c_wide_mask = (df["arm_is_carry"] == 1.0) & (v_max_num >= v_max_med)
-    c_compact_mask = (df["arm_is_carry"] == 0.0) & (v_max_num < v_max_med)
-
-    if c_wide_mask.sum() == 0 or c_compact_mask.sum() == 0:
-        c_wide_mask = (df["arm_is_carry"] == 1.0) | (v_max_num >= v_max_med)
-        c_compact_mask = (df["arm_is_carry"] == 0.0) | (v_max_num < v_max_med)
+    # Mutually exclusive configuration groups: Extended Carry Arm (c_wide) vs Tucked Arm (c_compact)
+    c_wide_mask = (df["arm_is_carry"] == 1.0)
+    c_compact_mask = (df["arm_is_carry"] == 0.0)
 
     print("\n" + "="*85)
     print(" MODEL-FREE STRATIFIED CROSSOVER ANALYSIS (TABLE III)")
