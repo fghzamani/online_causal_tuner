@@ -80,10 +80,16 @@ def evaluate_crossover(data_path: str, output_dir: str):
     footprint_col = [c for c in df.columns if "footprint" in c][0]
     target_col = "y_h" if "y_h" in df.columns else "collision"
 
-    df["is_collision"] = df[target_col].astype(int)
+    df["is_collision"] = pd.to_numeric(df[target_col], errors="coerce").fillna(0).astype(int)
 
-    # Encode footprint if string
-    df["arm_is_carry"] = df[footprint_col].apply(lambda v: 1.0 if str(v) == "carry" else (0.0 if str(v) == "tucked" else float(v)))
+    # Encode footprint safely
+    def parse_fp(v):
+        s = str(v).lower()
+        if "carry" in s: return 1.0
+        if "tucked" in s or "home" in s: return 0.0
+        try: return float(v)
+        except: return 0.0
+    df["arm_is_carry"] = df[footprint_col].apply(parse_fp)
 
     # Define Strata
     strata_masks = {

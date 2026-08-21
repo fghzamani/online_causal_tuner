@@ -55,13 +55,13 @@ def evaluate_competing_risks(data_path: str, output_dir: str):
     logger.info(f"Loaded {len(df)} total rows from {data_path}.")
 
     target_col = "y_h" if "y_h" in df.columns else "collision"
-    df["is_collision"] = df[target_col].astype(int)
+    df["is_collision"] = pd.to_numeric(df[target_col], errors="coerce").fillna(0).astype(int)
 
     # Check for path block / planning fail column
     if "b_h" in df.columns:
-        df["is_blocked"] = df["b_h"].astype(int)
+        df["is_blocked"] = pd.to_numeric(df["b_h"], errors="coerce").fillna(0).astype(int)
     elif "path_found" in df.columns:
-        df["is_blocked"] = (df["path_found"] == 0).astype(int)
+        df["is_blocked"] = (pd.to_numeric(df["path_found"], errors="coerce").fillna(1) == 0).astype(int)
     else:
         # Synthetic path block indicator based on high inflation + narrow corridor
         r_width_col = [c for c in df.columns if "width" in c or "corridor" in c][0]

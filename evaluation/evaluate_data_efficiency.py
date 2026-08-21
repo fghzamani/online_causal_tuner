@@ -76,20 +76,26 @@ def extract_dataset(data_path: str):
     param_cols = [c for c in df.columns if c.startswith("param__")]
 
     if "y_h" in df.columns:
-        y_safe = df["y_h"].astype(int).values
+        y_safe = pd.to_numeric(df["y_h"], errors="coerce").fillna(0).astype(int).values
     elif "collision" in df.columns:
-        y_safe = df["collision"].astype(int).values
+        y_safe = pd.to_numeric(df["collision"], errors="coerce").fillna(0).astype(int).values
     else:
         y_safe = np.zeros(len(df), dtype=int)
 
     if "probe_progress_m" in df.columns:
-        y_prog = df["probe_progress_m"].astype(float).values
+        y_prog = pd.to_numeric(df["probe_progress_m"], errors="coerce").fillna(0.0).astype(float).values
     else:
         y_prog = np.ones(len(df), dtype=float)
 
     for col in param_cols:
         if col == "param__local_costmap__footprint":
-            df[col] = df[col].apply(lambda v: 1.0 if str(v) == "carry" else (0.0 if str(v) == "tucked" else float(v)))
+            def parse_fp(v):
+                s = str(v).lower()
+                if "carry" in s: return 1.0
+                if "tucked" in s or "home" in s: return 0.0
+                try: return float(v)
+                except: return 0.0
+            df[col] = df[col].apply(parse_fp)
         else:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
 
