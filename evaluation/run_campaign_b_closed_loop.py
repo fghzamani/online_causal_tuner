@@ -72,6 +72,7 @@ def run_campaign_b_closed_loop(num_episodes: int, output_csv: str, map_yaml: str
         runner = TrialRunner(
             output_dir="paper_artifacts",
             map_yaml_path=map_yaml,
+            gt_min_rate_hz=0.0,
             timeout_sec=120.0
         )
         pose_sampler = PoseSampler(map_yaml_path=map_yaml, seed=42)
