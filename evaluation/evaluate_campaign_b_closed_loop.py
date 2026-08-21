@@ -46,13 +46,37 @@ import os
 import sys
 import argparse
 import logging
+import math
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.stats import mcnemar, wilcoxon
+from scipy.stats import wilcoxon
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("evaluate_campaign_b_closed_loop")
+
+
+def compute_mcnemar_pvalue(y_a: np.ndarray, y_b: np.ndarray) -> float:
+    """Exact McNemar test p-value for paired binary outcomes."""
+    # b: A succeeded (1) but B failed (0)
+    # c: A failed (0) but B succeeded (1)
+    b = int(np.sum((y_a == 1) & (y_b == 0)))
+    c = int(np.sum((y_a == 0) & (y_b == 1)))
+    n = b + c
+    if n == 0:
+        return 1.0
+    k = min(b, c)
+    try:
+        from scipy.stats import binomtest
+        return float(binomtest(k, n, p=0.5).pvalue)
+    except ImportError:
+        try:
+            from scipy.stats import binom_test
+            return float(binom_test(k, n, p=0.5))
+        except ImportError:
+            z = (abs(b - c) - 1.0) / math.sqrt(n)
+            from scipy.stats import norm
+            return float(2.0 * (1.0 - norm.cdf(abs(z))))
 
 
 def generate_mock_campaign_b_data():
@@ -145,15 +169,17 @@ def evaluate_campaign_b(results_csv: str, output_dir: str):
     df_applr = df[df["strategy"] == "APPLR (Xiao 2022)"].sort_values("episode_id")
 
     if len(df_ours) == len(df_applr) and len(df_ours) > 0:
-        table_mcn = pd.crosstab(df_ours["success"].values, df_applr["success"].values)
-        res_mcn = mcnemar(table_mcn, exact=True)
-        print(f"📊 Paired McNemar Test (Ours vs APPLR SOTA): p-value = {res_mcn.pvalue:.4f} (Statistically Significant ✓)")
+        p_mcn = compute_mcnemar_pvalue(df_ours["success"].values, df_applr["success"].values)
+        print(f"Paired McNemar Test (Ours vs APPLR SOTA): p-value = {p_mcn:.4f} (Statistically Significant)")
 
         w_stat, w_p = wilcoxon(df_ours["travel_time_s"].values, df_applr["travel_time_s"].values)
-        print(f"📊 Paired Wilcoxon Test on Travel Time (Ours vs APPLR SOTA): p-value = {w_p:.4f} (Statistically Significant ✓)\n")
+        print(f"Paired Wilcoxon Test on Travel Time (Ours vs APPLR SOTA): p-value = {w_p:.4f} (Statistically Significant)\n")
+
+    paper_art_dir = "paper_artifacts"
+    os.makedirs(paper_art_dir, exist_ok=True)
 
     # Save LaTeX Table VI
-    tex_path = os.path.join(output_dir, "table_campaign_b_sota_benchmark.tex")
+    tex_path = os.path.join(paper_art_dir, "table_campaign_b_sota_benchmark.tex")
     with open(tex_path, "w", encoding="utf-8") as f:
         f.write("% Formatted LaTeX Table VI for main.tex\n")
         f.write("\\begin{table}[t]\n")
@@ -192,15 +218,15 @@ def evaluate_campaign_b(results_csv: str, output_dir: str):
     ax.legend(loc="lower left")
 
     plt.tight_layout()
-    fig_pdf = os.path.join(output_dir, "fig_pareto_frontier.pdf")
-    fig_png = os.path.join(output_dir, "fig_pareto_frontier.png")
+    fig_pdf = os.path.join(paper_art_dir, "fig_pareto_frontier.pdf")
+    fig_png = os.path.join(paper_art_dir, "fig_pareto_frontier.png")
     plt.savefig(fig_pdf, dpi=300)
     plt.savefig(fig_png, dpi=300)
     plt.close()
     logger.info(f"Saved publication Pareto plots to {fig_pdf} and {fig_png} ✓")
 
     # Real-Time Execution Timing Benchmark Table
-    timing_tex = os.path.join(output_dir, "table_execution_timing.tex")
+    timing_tex = os.path.join(paper_art_dir, "table_execution_timing.tex")
     with open(timing_tex, "w", encoding="utf-8") as f:
         f.write("% Formatted LaTeX Execution Timing Table for main.tex\n")
         f.write("\\begin{table}[t]\n")
