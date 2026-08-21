@@ -14,6 +14,10 @@ Usage:
 
 import os
 import sys
+
+# Ensure rct_collector package is in path
+sys.path.insert(0, "/home/forough/phd_projects/online_tuner/src/rct_data_collector")
+
 import yaml
 import argparse
 import logging
