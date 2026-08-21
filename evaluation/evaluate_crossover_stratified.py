@@ -73,19 +73,19 @@ def evaluate_crossover(data_path: str, output_dir: str):
     df = pd.read_csv(data_path)
     logger.info(f"Loaded {len(df)} total rows from {data_path}.")
 
-    # Identify risk & config columns
-    r_width_col = [c for c in df.columns if "width" in c or "corridor" in c][0]
-    r_min_col = [c for c in df.columns if "min" in c or "clearance" in c][0]
-    v_max_col = [c for c in df.columns if "vx_max" in c][0]
-    footprint_col = [c for c in df.columns if "footprint" in c][0]
+    # Identify exact treatment parameter and risk columns
+    footprint_col = "param__local_costmap__footprint" if "param__local_costmap__footprint" in df.columns else [c for c in df.columns if c.startswith("param__") and "footprint" in c][0]
+    v_max_col = "param__controller_server__FollowPath.vx_max" if "param__controller_server__FollowPath.vx_max" in df.columns else [c for c in df.columns if c.startswith("param__") and "vx_max" in c][0]
+    r_width_col = "risk__r_width" if "risk__r_width" in df.columns else [c for c in df.columns if "width" in c][0]
+    r_min_col = "risk__r_min" if "risk__r_min" in df.columns else [c for c in df.columns if "min" in c][0]
     target_col = "y_h" if "y_h" in df.columns else "collision"
 
     df["is_collision"] = pd.to_numeric(df[target_col], errors="coerce").fillna(0).astype(int)
 
-    # Encode footprint polygon string or label safely
+    # Encode footprint safely
     def parse_fp(v):
         s = str(v).lower()
-        if "carry" in s or "0.698" in s or "0.420" in s or "0.641" in s or "0.646" in s:
+        if "carry" in s or "0.698" in s or "0.420" in s:
             return 1.0
         if "tucked" in s or "home" in s:
             return 0.0
@@ -93,7 +93,7 @@ def evaluate_crossover(data_path: str, output_dir: str):
             val = float(v)
             return 1.0 if val >= 0.5 else 0.0
         except:
-            return 1.0 if len(s) > 200 else 0.0
+            return 0.0
     df["arm_is_carry"] = df[footprint_col].apply(parse_fp)
 
     # Quantile-based strata thresholds

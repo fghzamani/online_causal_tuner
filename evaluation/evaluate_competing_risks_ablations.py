@@ -116,12 +116,12 @@ def evaluate_competing_risks(data_path: str, output_dir: str):
     # -------------------------------------------------------------------------
     # ABLATION 2: Software-Only vs. Software + Physical Envelope Adaptation
     # -------------------------------------------------------------------------
-    footprint_col = [c for c in df.columns if "footprint" in c][0]
-    r_width_col = [c for c in df.columns if "width" in c or "corridor" in c][0]
+    footprint_col = "param__local_costmap__footprint" if "param__local_costmap__footprint" in df.columns else [c for c in df.columns if c.startswith("param__") and "footprint" in c][0]
+    r_width_col = "risk__r_width" if "risk__r_width" in df.columns else [c for c in df.columns if "width" in c][0]
     
     def parse_fp(v):
         s = str(v).lower()
-        if "carry" in s or "0.698" in s or "0.420" in s or "0.641" in s or "0.646" in s:
+        if "carry" in s or "0.698" in s or "0.420" in s:
             return 1.0
         if "tucked" in s or "home" in s:
             return 0.0
@@ -129,7 +129,7 @@ def evaluate_competing_risks(data_path: str, output_dir: str):
             val = float(v)
             return 1.0 if val >= 0.5 else 0.0
         except:
-            return 1.0 if len(s) > 200 else 0.0
+            return 0.0
     df["arm_is_carry"] = df[footprint_col].apply(parse_fp)
 
     # Narrow Channel Subpopulation (lower 33rd percentile quantile)
