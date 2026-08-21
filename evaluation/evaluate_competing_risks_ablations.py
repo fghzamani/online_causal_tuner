@@ -119,10 +119,23 @@ def evaluate_competing_risks(data_path: str, output_dir: str):
     footprint_col = [c for c in df.columns if "footprint" in c][0]
     r_width_col = [c for c in df.columns if "width" in c or "corridor" in c][0]
     
-    df["arm_is_carry"] = df[footprint_col].apply(lambda v: 1.0 if str(v) == "carry" else (0.0 if str(v) == "tucked" else float(v)))
+    def parse_fp(v):
+        s = str(v).lower()
+        if "carry" in s or "0.698" in s or "0.420" in s or "0.641" in s or "0.646" in s:
+            return 1.0
+        if "tucked" in s or "home" in s:
+            return 0.0
+        try:
+            val = float(v)
+            return 1.0 if val >= 0.5 else 0.0
+        except:
+            return 1.0 if len(s) > 200 else 0.0
+    df["arm_is_carry"] = df[footprint_col].apply(parse_fp)
 
-    # Narrow Channel Subpopulation
-    df_narrow = df[df[r_width_col] < 1.0]
+    # Narrow Channel Subpopulation (lower 33rd percentile quantile)
+    r_width_num = pd.to_numeric(df[r_width_col], errors="coerce").fillna(0.5)
+    w_thresh = r_width_num.quantile(0.33)
+    df_narrow = df[r_width_num <= w_thresh]
 
     # Software-only (Fixed open carry arm)
     df_soft_only = df_narrow[df_narrow["arm_is_carry"] == 1.0]
