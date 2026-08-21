@@ -91,19 +91,27 @@ def evaluate_crossover(data_path: str, output_dir: str):
         except: return 0.0
     df["arm_is_carry"] = df[footprint_col].apply(parse_fp)
 
-    # Define Strata
+    # Quantile-based strata thresholds
+    r_width_num = pd.to_numeric(df[r_width_col], errors="coerce").fillna(0.5)
+    r_min_num = pd.to_numeric(df[r_min_col], errors="coerce").fillna(0.5)
+    v_max_num = pd.to_numeric(df[v_max_col], errors="coerce").fillna(0.35)
+
+    r_width_q33 = r_width_num.quantile(0.33)
+    r_width_q66 = r_width_num.quantile(0.66)
+    r_min_q33 = r_min_num.quantile(0.33)
+    v_max_med = v_max_num.median()
+
     strata_masks = {
-        "Narrow Channel (r_width < 1.0m)": df[r_width_col] < 1.0,
-        "Medium Corridor (1.0m <= r_width < 1.5m)": (df[r_width_col] >= 1.0) & (df[r_width_col] < 1.5),
-        "Open Space (r_width >= 1.5m)": df[r_width_col] >= 1.5,
-        "High Obstacle Proximity (r_min < 0.4m)": df[r_min_col] < 0.4,
+        f"Narrow Channel ({r_width_col.split('__')[-1]} <= {r_width_q33:.2f})": r_width_num <= r_width_q33,
+        f"Medium Corridor ({r_width_q33:.2f} < width < {r_width_q66:.2f})": (r_width_num > r_width_q33) & (r_width_num < r_width_q66),
+        f"Open Space ({r_width_col.split('__')[-1]} >= {r_width_q66:.2f})": r_width_num >= r_width_q66,
+        f"High Proximity ({r_min_col.split('__')[-1]} <= {r_min_q33:.2f})": r_min_num <= r_min_q33,
     }
 
-    # Define Configuration Subgroups
-    # c_wide: Carry arm (open envelope) + Fast (vx_max > 0.45 m/s)
-    # c_compact: Tucked arm (minimal envelope) + Slow (vx_max <= 0.35 m/s)
-    c_wide_mask = (df["arm_is_carry"] == 1.0) & (df[v_max_col] > 0.45)
-    c_compact_mask = (df["arm_is_carry"] == 0.0) & (df[v_max_col] <= 0.35)
+    # c_wide: Carry arm (open envelope) OR Fast speed (> median)
+    # c_compact: Tucked arm (minimal envelope) OR Slow speed (<= median)
+    c_wide_mask = (df["arm_is_carry"] == 1.0) | (v_max_num > v_max_med)
+    c_compact_mask = (df["arm_is_carry"] == 0.0) | (v_max_num <= v_max_med)
 
     print("\n" + "="*85)
     print(" MODEL-FREE STRATIFIED CROSSOVER ANALYSIS (TABLE III)")
