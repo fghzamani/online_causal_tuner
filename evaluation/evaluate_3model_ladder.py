@@ -165,6 +165,10 @@ def extract_features_and_groups(data_path: str):
     X_RC = np.column_stack(interactions)
     X_full = np.hstack([X_R, X_C, X_RC])
 
+    X_R = np.nan_to_num(X_R, nan=0.0, posinf=0.0, neginf=0.0)
+    X_C = np.nan_to_num(X_C, nan=0.0, posinf=0.0, neginf=0.0)
+    X_full = np.nan_to_num(X_full, nan=0.0, posinf=0.0, neginf=0.0)
+
     return X_R, X_C, X_full, y_safe, y_prog, groups
 
 

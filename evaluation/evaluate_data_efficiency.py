@@ -129,6 +129,7 @@ def extract_dataset(data_path: str):
     ]
     X_RC = np.column_stack(interactions)
     X_full = np.hstack([X_R, X_C, X_RC])
+    X_full = np.nan_to_num(X_full, nan=0.0, posinf=0.0, neginf=0.0)
 
     return X_full, y_safe, y_prog, episodes
 
