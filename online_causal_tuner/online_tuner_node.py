@@ -112,7 +112,7 @@ MIN_SPEED_LIMIT = 30.0
 
 # Gate B5: Optimized Candidate Grid Space (2304 grid points)
 PARAM_CANDIDATE_GRID = {
-    "param__controller_server__speed_limit_pct": [30.0, 50.0, 70.0, 90.0],
+    "param__controller_server__speed_limit_pct": [30.0, 50.0, 70.0, 90.0, 100.0],
     "param__controller_server__FollowPath.vx_std": [0.15, 0.35],
     "param__controller_server__FollowPath.ConstraintCritic.cost_weight": [0.5, 3.0, 6.0],
     "param__controller_server__FollowPath.CostCritic.cost_weight": [1.0, 5.0, 10.0, 20.0],
@@ -131,12 +131,12 @@ class OnlineCausalTunerNode(Node):
 
         # Gate A1: Declare ROS parameters matching single YAML source of truth
         self.declare_parameter("model_path", "/home/forough/phd_projects/online_tuner/src/online_causal_tuner/models/causal_tuner_models.pkl")
-        self.declare_parameter("risk_threshold_p_max", 0.10)
+        self.declare_parameter("risk_threshold_p_max", 0.15)
         self.declare_parameter("risk_penalty_lambda", 10.0)
         self.declare_parameter("stall_penalty_mu", 2.0)
-        self.declare_parameter("payload_value_omega", 0.5)
+        self.declare_parameter("payload_value_omega", 0.8333333333333334)
         self.declare_parameter("utility_deadband_frac", 0.025)
-        self.declare_parameter("arm_switch_cost_frac", 0.055)
+        self.declare_parameter("arm_switch_cost_frac", 0.25)
         self.declare_parameter("clearance_margin_m", 0.10)
         self.declare_parameter("decel_limit_mps2", 0.60)
         self.declare_parameter("inflation_floor_m", 0.15)
@@ -145,10 +145,10 @@ class OnlineCausalTunerNode(Node):
         self.declare_parameter("envelope_only", False)
         self.declare_parameter("pessimism_alpha", 0.20)
         self.declare_parameter("anticipation_delta_s", 4.0)
-        self.declare_parameter("selection_mode", "enumerate")
         self.declare_parameter("terminal_radius_m", 1.0)
         self.declare_parameter("arm_switch_dwell_s", 8.0)
         self.declare_parameter("arm_switch_persist_ticks", 5)
+        self.declare_parameter("envelope_hysteresis_m", 0.25)
 
         self.model_path = self.get_parameter("model_path").get_parameter_value().string_value
         self.p_max = self.get_parameter("risk_threshold_p_max").get_parameter_value().double_value
@@ -165,10 +165,16 @@ class OnlineCausalTunerNode(Node):
         self.envelope_only = self.get_parameter("envelope_only").get_parameter_value().bool_value
         self.alpha = self.get_parameter("pessimism_alpha").get_parameter_value().double_value
         self.anticipation_delta = self.get_parameter("anticipation_delta_s").get_parameter_value().double_value
-        self.selection_mode = self.get_parameter("selection_mode").get_parameter_value().string_value
         self.terminal_radius = self.get_parameter("terminal_radius_m").get_parameter_value().double_value
         self.arm_switch_dwell = self.get_parameter("arm_switch_dwell_s").get_parameter_value().double_value
         self.arm_persist_ticks = self.get_parameter("arm_switch_persist_ticks").get_parameter_value().integer_value
+        self.envelope_hysteresis_m = self.get_parameter("envelope_hysteresis_m").get_parameter_value().double_value
+
+        self.carry_distance_m = 0.0
+        self.total_distance_m = 0.0
+        self.last_odom_pose = None
+        self.pending_inflation = None
+        self.pending_inflation_count = 0
 
         from collections import deque
         self.risk_history = deque(maxlen=90)   # ~3 s at 30 Hz
@@ -214,6 +220,10 @@ class OnlineCausalTunerNode(Node):
         self.last_applied_config = None
         self.current_arm_label = "carry"
         self.target_arm_label = "carry"
+        # What the policy *chose* before A(R) clamped it. Distinct from
+        # target_arm_label, which records what was actually applied. A
+        # geometry-forced retraction must not become the hysteresis reference.
+        self.preferred_arm_label = "carry"
         self.arm_state_initialized = False
         self.arm_transition_until_time = 0.0
         self.current_speed = 0.0
@@ -371,37 +381,13 @@ class OnlineCausalTunerNode(Node):
                     "estimates. Selection will be optimistically biased."
                 )
 
-            # Load policy tree
-            self.policy_tree = artifact.get("policy_tree", None)
-            self.policy_leaf_action = {
-                int(k): int(v) for k, v in artifact.get("policy_leaf_action", {}).items()
-            }
-            if self.policy_tree is not None and not self.policy_leaf_action:
-                self.get_logger().error(
-                    "policy_tree present without policy_leaf_action -- artifact "
-                    "predates the leaf-assignment fix. Retrain before using "
-                    "selection_mode=policy_tree."
-                )
-                self.policy_tree = None
-
-            self.policy_action_cells = artifact.get("policy_action_cells", [])
-            self.policy_action_cols = artifact.get("policy_action_cols", [])
-            self.policy_risk_cols = artifact.get("policy_risk_cols", [])
-
-            if getattr(self, "policy_action_cols", None):
-                uncontrolled = [k for k in PARAM_CANDIDATE_GRID
-                                if k not in self.policy_action_cols]
-                self.get_logger().info(
-                    f"Distilled policy controls {len(self.policy_action_cols)} of "
-                    f"{len(PARAM_CANDIDATE_GRID)} knobs; held at grid median: {uncontrolled}")
-
             w = artifact.get("objective_weights")
             if w is None:
                 self.get_logger().error(
                     "Artifact has no objective_weights; it predates the objective "
-                    "fix. The policy tree was trained on a different utility than "
-                    "this node optimizes. Retrain before using selection_mode=policy_tree.")
-                self.policy_tree = None
+                    "fix. The models were fitted against a different utility than "
+                    "this node optimizes. Retrain before running.")
+                self.models_loaded = False
             else:
                 mapping = {"risk_lambda": "risk_lambda", "stall_mu": "stall_mu", "payload_omega": "payload_omega"}
                 mismatch = {k: (v, getattr(self, mapping[k]))
@@ -412,7 +398,6 @@ class OnlineCausalTunerNode(Node):
                         f"Objective weight mismatch (artifact vs node): {mismatch}. "
                         "The learned policy optimizes a different objective than this "
                         "node. Refusing to load. Fix the ROS parameters or retrain.")
-                    self.policy_tree = None
                     self.models_loaded = False
                     return
 
@@ -443,15 +428,45 @@ class OnlineCausalTunerNode(Node):
         half = geom["width"] / 2.0
         delta = self.clearance_margin_m
 
-        # 1. Pose must physically fit through passage constriction
-        if r_width < width + 2.0 * delta:
+        # 1. The envelope must fit the constriction. Asymmetric by design:
+        #    r_width is min(measured, forecast) and therefore noisy, so a
+        #    single threshold makes carry flicker in and out of the feasible
+        #    set and the arm chatters. Adopting carry requires extra clearance;
+        #    retaining it does not.
+        #    Carry mode expands the physical footprint laterally and forward.
+        #    Adopting carry requires corridor width (r_width >= 1.35m) AND obstacle clearance (r_min >= 1.20m).
+        #    Retaining carry requires corridor width (r_width >= 1.25m) AND obstacle clearance (r_min >= 0.80m).
+        #    Prevents adopting or keeping carry in temporary small openings inside dense clutter or door frames.
+        is_carry_cand = (float(cand[FOOTPRINT_KEY]) == 1.0)
+        is_currently_carry = (getattr(self, "target_arm_label", "tucked") == "carry")
+
+        if is_carry_cand:
+            if not is_currently_carry:
+                need_width = width + 2.0 * delta + self.envelope_hysteresis_m
+                if r_width < need_width or r_min < 1.20:
+                    return False
+            else:
+                need_width = width + 2.0 * delta + 0.15
+                if r_width < need_width or r_min < 0.80:
+                    return False
+        else:
+            need_width = width + 2.0 * delta
+            if r_width < need_width:
+                return False
+
+        # 2. Inflation must not smother the passage the robot has to traverse.
+        #    In a constriction, a wide inflated region makes every cell in it
+        #    expensive. The free lateral half-gap is the ceiling.
+        #    When close to obstacles (r_min < 0.50m), candidate inflation must be
+        #    at least 0.25m to prevent base footprint clipping.
+        lateral = (r_width - width) / 2.0 - delta
+        max_allowed_inf = max(self.inflation_floor_m, lateral)
+        if r_min < 1.2:
+            max_allowed_inf = min(max_allowed_inf, 0.30)
+        if float(cand[INFLATION_KEY]) > max_allowed_inf + 1e-6:
             return False
 
-        # 2. Inflation must not close free lateral gap or swallow robot footprint
-        lateral = (r_width - width) / 2.0 - delta
-        radial = r_min - half - delta
-        max_allowed_inf = max(self.inflation_floor_m, min(lateral, radial))
-        if float(cand[INFLATION_KEY]) > max_allowed_inf + 1e-6:
+        if r_min < 0.50 and float(cand[INFLATION_KEY]) < 0.25 - 1e-6:
             return False
 
         # 3. Kinematic stopping velocity ceiling: v_max <= sqrt(2 * a * stopping)
@@ -477,6 +492,15 @@ class OnlineCausalTunerNode(Node):
         vx = msg.twist.twist.linear.x
         vy = msg.twist.twist.linear.y
         self.current_speed = math.sqrt(vx**2 + vy**2)
+        px = msg.pose.pose.position.x
+        py = msg.pose.pose.position.y
+        if getattr(self, "last_odom_pose", None) is not None:
+            dist = math.hypot(px - self.last_odom_pose[0], py - self.last_odom_pose[1])
+            if dist < 1.0:  # filter potential resets/jumps
+                self.total_distance_m += dist
+                if getattr(self, "verified_arm_label", None) == "carry":
+                    self.carry_distance_m += dist
+        self.last_odom_pose = (px, py)
 
     def _sim_time_sec(self) -> float:
         """Return current ROS simulation time in seconds."""
@@ -508,18 +532,25 @@ class OnlineCausalTunerNode(Node):
         coef, *_ = np.linalg.lstsq(A, Y, rcond=None)   # (2, n_features)
         pred = coef[0] * delta_s + coef[1]
 
-        # Clip each feature to the range seen in the buffer plus a small margin,
-        # so a noisy slope cannot extrapolate to an implausible context.
-        lo, hi = Y.min(axis=0), Y.max(axis=0)
-        span = np.maximum(hi - lo, 1e-3)
-        pred_clipped = np.clip(pred, lo - 0.5 * span, hi + 0.5 * span)
+        # Clip each feature to physical domain bounds, so linear extrapolation
+        # can predict upcoming constrictions without buffer clipping floors
+        # blocking the anticipation lookahead.
+        min_bounds = np.zeros_like(pred)
+        max_bounds = np.full(len(pred), 10.0)
+        bounds_spec = [5.0, 10.0, 10.0, 1.0, 5.0, 5.0, 10.0, 10.0, 10.0]
+        for i in range(min(len(pred), len(bounds_spec))):
+            max_bounds[i] = bounds_spec[i]
+        pred_clipped = np.clip(pred, min_bounds, max_bounds)
         
         return list(pred_clipped[:len(self.current_risk_vector)])
 
     def _evaluate_utility(self, expected_progress: float, p_collision: float, p_stall: float, is_carry: float) -> float:
-        """Compute multiplicative hurdle utility U(c, R_t)."""
+        """Compute Hurdle utility U(c, R_t) with payload transport task reward."""
+        j_max = float(self.progress_support.get("max", 3.135)) if hasattr(self, "progress_support") and isinstance(self.progress_support, dict) else 3.135
+        payload_reward = self.payload_omega * is_carry * j_max
         return (
-            (1.0 + self.payload_omega * is_carry) * expected_progress
+            expected_progress
+            + payload_reward
             - (self.risk_lambda * p_collision)
             - (self.stall_mu * p_stall)
         )
@@ -562,87 +593,7 @@ class OnlineCausalTunerNode(Node):
                 row["out_of_support"] = False
             self.last_oos_fraction = float("nan")
 
-    def _risk_row_for_policy(self, risk_vector):
-        d = {n: (risk_vector[i] if i < len(risk_vector) else 0.0)
-             for i, n in enumerate(RISK_FEATURE_NAMES)}
-        missing = [c for c in self.policy_risk_cols if c not in d]
-        if missing:
-            raise KeyError(f"Policy expects risk features not on /risk_state: {missing}")
-        return np.array([[d[c] for c in self.policy_risk_cols]], dtype=float)
 
-    def _solve_by_policy_tree(self, risk_vector):
-        """O(depth) selection. The tree encodes the DR-optimal action per context."""
-        r = self._risk_row_for_policy(risk_vector)
-        leaf = int(self.policy_tree.apply(r)[0])
-        action_idx = self.policy_leaf_action.get(leaf)
-        if action_idx is None:
-            self.get_logger().error(
-                f"Leaf {leaf} missing from policy_leaf_action; falling back to "
-                "bounded argmax for this tick."
-            )
-            return None
-        cell = self.policy_action_cells[int(action_idx)]
-        row = dict(zip(self.policy_action_cols, cell))
-        # Knobs the distilled policy does not control are held at the grid
-        # median, so every emitted configuration is a member of C.
-        for key, levels in PARAM_CANDIDATE_GRID.items():
-            if key not in row:
-                row[key] = float(np.median(levels))
-        row["selection_reason"] = f"POLICY_TREE (leaf={leaf})"
-
-        # Evaluate model predictions for this single row to populate log metrics
-        risk_dict = {name: risk_vector[i] if i < len(risk_vector) else 0.0 for i, name in enumerate(RISK_FEATURE_NAMES)}
-        r_min = float(risk_dict.get("risk__r_min", 3.0))
-        r_width = float(risk_dict.get("risk__r_width", 5.0))
-        if not self._admissible(row, r_min, r_width):
-            row = self._project_to_admissible(row, r_min, r_width)
-
-        candidates_with_eval, X_arr = self._prepare_feature_vectors([row], risk_dict)
-        if candidates_with_eval is None:
-            return row
-
-        self._evaluate_positivity(X_arr, candidates_with_eval)
-        eval_row = candidates_with_eval[0]
-        
-        p_c = float(self.safety_model.predict_proba(X_arr)[0, 1])
-        p_st = float(self.stall_model.predict_proba(X_arr)[0, 1])
-        max_prog_support = float(self.progress_support["max"])
-        e_sp = float(np.clip(self.speed_model.predict(X_arr)[0], 0.0, max_prog_support))
-        expected_progress = (1.0 - p_st) * e_sp
-        
-        is_carry = 1.0 if float(eval_row.get(FOOTPRINT_KEY, 0.0)) == 1.0 else 0.0
-        utility_raw = self._evaluate_utility(expected_progress, p_c, p_st, is_carry)
-        
-        eval_row["p_risk"] = p_c
-        eval_row["p_risk_ucb"] = p_c
-        eval_row["p_risk_sd"] = 0.0
-        eval_row["p_stall"] = p_st
-        eval_row["p_stall_ucb"] = p_st
-        eval_row["e_speed"] = e_sp
-        eval_row["j_progress"] = expected_progress
-        eval_row["utility_raw"] = utility_raw
-        eval_row["utility"] = utility_raw
-        eval_row["utility_point"] = utility_raw
-
-        # Enforce arm switch hysteresis to suppress unnecessary arm motion on minor risk noise
-        ref_arm = getattr(self, "target_arm_label", self.current_arm_label)
-        cand_arm = "carry" if float(row.get(FOOTPRINT_KEY, 0.0)) == 1.0 else "tucked"
-        if ref_arm and cand_arm != ref_arm:
-            curr_fp_val = 1.0 if ref_arm == "carry" else 0.0
-            row_curr = row.copy()
-            row_curr[FOOTPRINT_KEY] = curr_fp_val
-            _, X_curr = self._prepare_feature_vectors([row_curr], risk_dict)
-            if X_curr is not None:
-                pc_curr = float(self.safety_model.predict_proba(X_curr)[0, 1])
-                pst_curr = float(self.stall_model.predict_proba(X_curr)[0, 1])
-                esp_curr = float(np.clip(self.speed_model.predict(X_curr)[0], 0.0, max_prog_support))
-                prog_curr = (1.0 - pst_curr) * esp_curr
-                u_curr = self._evaluate_utility(prog_curr, pc_curr, pst_curr, curr_fp_val)
-                if (utility_raw - u_curr) < self.arm_switch_cost:
-                    eval_row[FOOTPRINT_KEY] = curr_fp_val
-                    eval_row["selection_reason"] += f" (retained {ref_arm} via hysteresis)"
-            
-        return eval_row
 
     def set_goal(self, goal_pose):
         """Called by the runner at trial start. Enables terminal-phase detection."""
@@ -697,15 +648,18 @@ class OnlineCausalTunerNode(Node):
         geom = FOOTPRINT_GEOMETRY[float(out[FOOTPRINT_KEY])]
         d = self.clearance_margin_m
 
+        # Capture the policy's own arm choice before the constraint clamps it.
+        self.preferred_arm_label = (
+            "carry" if float(out[FOOTPRINT_KEY]) == 1.0 else "tucked")
+
         if r_width < geom["width"] + 2.0 * d:
             out[FOOTPRINT_KEY] = 0.0
             geom = FOOTPRINT_GEOMETRY[0.0]
             out["selection_reason"] += " [proj:envelope->tucked]"
         half = geom["width"] / 2.0
 
-        lateral = (r_width - geom["width"]) / 2.0 - d
-        radial = r_min - half - d
-        max_inf = max(self.inflation_floor_m, min(lateral, radial))
+        max_inf = max(self.inflation_floor_m,
+                      (r_width - geom["width"]) / 2.0 - d)
         ok_inf = [v for v in PARAM_CANDIDATE_GRID[INFLATION_KEY] if v <= max_inf + 1e-6]
         tgt_inf = max(ok_inf) if ok_inf else self.inflation_floor_m
         if float(out[INFLATION_KEY]) > tgt_inf:
@@ -738,7 +692,10 @@ class OnlineCausalTunerNode(Node):
 
     def _tuning_loop(self):
         t0 = time.perf_counter()
-        self._tuning_loop_impl()
+        try:
+            self._tuning_loop_impl()
+        except Exception as e:
+            self.get_logger().error(f"Error in tuning loop tick: {e}", throttle_duration_sec=2.0)
         dt_ms = (time.perf_counter() - t0) * 1000.0
         self.max_tick_ms = max(self.max_tick_ms, dt_ms)
         if dt_ms > self.tick_period * 1000.0:
@@ -792,31 +749,55 @@ class OnlineCausalTunerNode(Node):
                 f"(d_goal={d_goal:.2f} m, radius={self.terminal_radius:.2f} m)")
         if self.in_terminal_phase:
             self.n_terminal_ticks += 1
-
-        r_eval = self._forecast_risk(self.anticipation_delta)
-        # Store for apply configuration decision log
-        self.last_forecast_risk = r_eval
-
-        if self.selection_mode == "policy_tree" and getattr(self, "policy_tree", None) is not None:
-            best_config = self._solve_by_policy_tree(r_eval)
+            best_config = self._terminal_config()
         else:
-            best_config = self.solve_optimal_configuration(r_eval)
+            r_eval = self._forecast_risk(self.anticipation_delta)
+            # Store for apply configuration decision log
+            self.last_forecast_risk = r_eval
+
+            best_config = self.solve_optimal_configuration(r_eval, self.current_risk_vector)
 
         if best_config is not None:
+            # Counted here rather than inside solve_optimal_configuration() so
+            # both selection modes are covered; the policy-tree path never
+            # calls the enumerating solver.
+            self.n_ticks += 1
+            if bool(best_config.get("out_of_support", False)):
+                self.n_out_of_support += 1
             self._apply_configuration(best_config)
 
-    def solve_optimal_configuration(self, risk_vector: list) -> dict:
+    def solve_optimal_configuration(self, risk_vector: list,
+                                    risk_measured: list = None) -> dict:
         """
         Solve C_t^* = argmax_{c in A(R)} U(c, R_t) subject to P_collision <= p_max.
+
+        `risk_vector` is the anticipated state and feeds the effect models.
+        `risk_measured` is the state as sensed now and, together with the
+        forecast, gates geometric feasibility. Feasibility is a claim about
+        the present, so a forecast may only tighten it, never relax it.
         """
         t_solve_start = time.perf_counter()
         sim_time = self._sim_time_sec()
         risk_dict = {name: risk_vector[i] if i < len(risk_vector) else 0.0 for i, name in enumerate(RISK_FEATURE_NAMES)}
 
-        r_min = float(risk_dict.get("risk__r_min", 3.0))
-        r_width = float(risk_dict.get("risk__r_width", 5.0))
+        meas = risk_measured if risk_measured is not None else risk_vector
+        meas_dict = {name: meas[i] if i < len(meas) else 0.0
+                     for i, name in enumerate(RISK_FEATURE_NAMES)}
 
-        self.n_ticks += 1
+        # Geometric feasibility uses the worse of measured and anticipated
+        # clearance. A 4 s linear extrapolation fitted on 1.5 s of history can
+        # predict a 6 m corridor while the robot sits in a 0.9 m gap; using it
+        # to decide whether the footprint fits puts the extended arm into door
+        # frames and raises the inflation ceiling at exactly the wrong moment.
+        # Taking the minimum keeps the anticipation benefit -- the forecast can
+        # only make the tuner retract earlier -- without ever permitting an
+        # envelope the robot does not currently fit.
+        r_min = min(float(risk_dict.get("risk__r_min", 3.0)),
+                    float(meas_dict.get("risk__r_min", 3.0)))
+        r_width = min(float(risk_dict.get("risk__r_width", 5.0)),
+                      float(meas_dict.get("risk__r_width", 5.0)))
+
+
 
         # Gate B1: Filter candidates via geometric and kinematic feasibility envelope A(R)
         feasible_candidates = [c for c in self.candidates_df if self._admissible(c, r_min, r_width)]
@@ -840,6 +821,8 @@ class OnlineCausalTunerNode(Node):
             best_row["out_of_support"] = False
             best_row["t_select_ms"] = (time.perf_counter() - t_select_start) * 1000.0
             self.last_oos_fraction = 0.0
+            self.preferred_arm_label = (
+                "carry" if float(best_row.get(FOOTPRINT_KEY, 0.0)) == 1.0 else "tucked")
             return best_row
 
         # Gate A4 & B2: Model inference and multiplicative Hurdle Utility scoring
@@ -865,11 +848,11 @@ class OnlineCausalTunerNode(Node):
             p_stall_point_all = np.zeros(len(X_arr))
 
         if hasattr(self.speed_model, "predict"):
-            e_speed_point_all = np.asarray(np.clip(self.speed_model.predict(X_arr), 0.0, max_prog_support))
+            e_speed_point_all = np.asarray(np.clip(self.speed_model.predict(X_arr) * self.anticipation_delta, 0.0, max_prog_support))
         else:
-            e_speed_point_all = np.ones(len(X_arr))
+            e_speed_point_all = np.ones(len(X_arr)) * self.anticipation_delta
 
-        j_point_all = (1.0 - p_stall_point_all) * e_speed_point_all
+        j_point_all = e_speed_point_all
 
         if self.use_bounds:
             if len(candidates_with_eval) > 100:
@@ -898,8 +881,8 @@ class OnlineCausalTunerNode(Node):
             P_stall = 1.0 / (1.0 + np.exp(-np.clip(Ws @ Z.T + bs[:, None], -30.0, 30.0)))
 
             Ws, bs, _ = self.ens_affine["speed"]
-            E_speed = np.clip(Ws @ Z.T + bs[:, None], 0.0, max_prog_support)
-            J = (1.0 - P_stall) * E_speed
+            E_speed = np.clip((Ws @ Z.T + bs[:, None]) * self.anticipation_delta, 0.0, max_prog_support)
+            J = E_speed
 
             p_point = P.mean(axis=0)
             p_stall_point = P_stall.mean(axis=0)
@@ -920,7 +903,7 @@ class OnlineCausalTunerNode(Node):
             j_lcb = j_point
             p_sd = np.zeros_like(p_point)
 
-            j_point = (1.0 - p_stall_point) * e_speed_point
+            j_point = e_speed_point
             
             p_ucb = p_point
             p_stall_ucb = p_stall_point
@@ -961,7 +944,12 @@ class OnlineCausalTunerNode(Node):
         safe_candidates = [c for c in candidates_with_eval if c["p_risk_ucb"] <= self.p_max]
 
         if safe_candidates:
-            ref_arm_label = getattr(self, "target_arm_label", self.current_arm_label)
+            # Same reasoning as the policy-tree path: switch cost is charged
+            # against the policy's own previous choice, not against a
+            # geometry-forced retraction.
+            ref_arm_label = (getattr(self, "preferred_arm_label", None)
+                             or getattr(self, "target_arm_label",
+                                        self.current_arm_label))
             curr_arm_val = 1.0 if ref_arm_label == "carry" else 0.0
             n_knobs = float(len(self.param_cols))
             
@@ -971,7 +959,9 @@ class OnlineCausalTunerNode(Node):
                 
                 if self.last_applied_config is not None:
                     if cand_arm != curr_arm_val:
-                        u_eff -= self.arm_switch_cost
+                        # Do not penalize extending back to carry when carry is safe in open space
+                        if not (cand_arm == 1.0 and ref_arm_label == "tucked"):
+                            u_eff -= self.arm_switch_cost
                         
                     n_changed = sum(
                         1 for k in self.param_cols
@@ -982,13 +972,28 @@ class OnlineCausalTunerNode(Node):
                         
                 c["utility_effective"] = u_eff
 
+            _u_best = max(c.get("utility_effective", c["utility_raw"])
+                          for c in safe_candidates)
+            _n_tied = sum(1 for c in safe_candidates
+                          if abs(c.get("utility_effective", c["utility_raw"])
+                                 - _u_best) < 1e-12)
+
             best_row = max(
                 safe_candidates,
                 key=lambda c: (
                     c.get("utility_effective", c["utility_raw"]),
-                    -float(c.get(SPEED_LIMIT_KEY, 95.0))
+                    # Ties are common and are an artefact, not a preference:
+                    # the progress prediction is clipped at the support
+                    # ceiling, so in open space every speed level returns the
+                    # same expected progress and the utilities are exactly
+                    # equal. Travel time is a reported outcome that the
+                    # utility does not represent, so break ties toward the
+                    # faster candidate rather than the slower one.
+                    float(c.get(SPEED_LIMIT_KEY, 100.0))
                 )
             ).copy()
+            best_row["n_tied_at_optimum"] = _n_tied
+            best_row["n_safe_candidates"] = len(safe_candidates)
             best_row["selection_reason"] = (
                 f"HURDLE_UTILITY_OPTIMAL (U_pess={best_row['utility_raw']:.3f}, U_point={best_row.get('utility_point', 0.0):.3f}, E[J_lcb]={best_row['j_progress_lcb']:.2f}m, "
                 f"P_coll_ucb={best_row['p_risk_ucb']:.4f}, P_stall_ucb={best_row['p_stall_ucb']:.3f})"
@@ -996,6 +1001,34 @@ class OnlineCausalTunerNode(Node):
         else:
             best_row = min(candidates_with_eval, key=lambda c: (c["p_risk_ucb"], c["p_stall_ucb"], -c["utility_raw"])).copy()
             best_row["selection_reason"] = f"FALLBACK_SAFEST (no candidate <= {self.p_max:.2f}, safest P_ucb={best_row['p_risk_ucb']:.4f})"
+            best_row["n_tied_at_optimum"] = 1
+            best_row["n_safe_candidates"] = 0
+
+        # Per-level best utility, so the decision surface is recoverable from
+        # the logs instead of being inferred from the winner alone.
+        def _best_by(key):
+            out = {}
+            for c in safe_candidates if safe_candidates else feasible_candidates:
+                k = round(float(c[key]), 3)
+                u = c.get("utility_effective", c["utility_raw"])
+                if k not in out or u > out[k]:
+                    out[k] = round(float(u), 5)
+            return out
+
+        best_row["u_by_speed"] = _best_by(SPEED_LIMIT_KEY)
+        best_row["u_by_inflation"] = _best_by(INFLATION_KEY)
+        best_row["u_by_costw"] = _best_by(COST_WEIGHT_KEY)
+        best_row["inf_ceiling"] = round(float(max(
+            self.inflation_floor_m,
+            (r_width - FOOTPRINT_GEOMETRY[float(best_row[FOOTPRINT_KEY])]["width"]) / 2.0
+            - self.clearance_margin_m)), 3)
+
+        # The enumerate path filters by _admissible() before scoring, so the
+        # winner is always feasible and its arm state is the policy's own
+        # choice. Record it here: the switch cost must be charged against a
+        # real previous decision, not against a value frozen at construction.
+        self.preferred_arm_label = (
+            "carry" if float(best_row.get(FOOTPRINT_KEY, 0.0)) == 1.0 else "tucked")
 
         best_row["t_infer_ms"] = t_infer_ms
         best_row["t_select_ms"] = (time.perf_counter() - t_select_start) * 1000.0
@@ -1101,9 +1134,8 @@ class OnlineCausalTunerNode(Node):
         if sim_now < self.arm_transition_until_time:
             speed_limit_pct = min(speed_limit_pct, 30.0)
 
-        # P0.2d: Footprint tracks physical envelope verified from /joint_states
-        envelope_label = self._envelope_label(arm_label)
-        target_footprint = ARM_CONFIGS[envelope_label]["footprint"]
+        # P0.2d: Local costmap footprint immediately tracks target configuration chosen by tuner
+        target_footprint = ARM_CONFIGS[arm_label]["footprint"]
 
         # P0.2e: Track verified physical arm state samples
         self.total_samples += 1
@@ -1120,7 +1152,7 @@ class OnlineCausalTunerNode(Node):
             (cost_weight != last_cfg.get("param__controller_server__FollowPath.CostCritic.cost_weight")) or
             (path_align_weight != last_cfg.get("param__controller_server__FollowPath.PathAlignCritic.cost_weight")) or
             (inflation != last_cfg.get("param__local_costmap__inflation_layer.inflation_radius")) or
-            (envelope_label != self.applied_envelope_label)
+            (arm_label != self.applied_envelope_label)
         )
 
         if any_param_changed:
@@ -1141,23 +1173,26 @@ class OnlineCausalTunerNode(Node):
         if path_align_weight != last_cfg.get("param__controller_server__FollowPath.PathAlignCritic.cost_weight"):
             self._set_param_async("controller_server", "FollowPath.PathAlignCritic.cost_weight", path_align_weight)
 
-        if inflation != last_cfg.get("param__local_costmap__inflation_layer.inflation_radius"):
+        last_inf = last_cfg.get("param__local_costmap__inflation_layer.inflation_radius")
+        if last_inf is None or abs(inflation - float(last_inf)) >= 1e-4:
             self._set_param_async("local_costmap", "inflation_layer.inflation_radius", inflation)
 
-        # P0.2d: Local costmap footprint tracks verified physical envelope; global footprint managed per-strategy
-        if envelope_label != self.applied_envelope_label:
-            self._set_param_async("local_costmap", "footprint", target_footprint)
-            self._publish_footprint_polygon(target_footprint)
-            self.applied_envelope_label = envelope_label
+        # The costmap must track the VERIFIED physical envelope, never
+        # the commanded one. Shrinking it at command time leaves 4 s in
+        # which Nav2 plans against a 0.55 m footprint around a robot
+        # whose arm is still swinging. _envelope_label() returns the
+        # larger of physical and target, and "carry" when the physical
+        # state is unknown.
+        env_label = self._envelope_label(arm_label)
+        if env_label != self.applied_envelope_label:
+            self._set_param_async(
+                "local_costmap", "footprint",
+                ARM_CONFIGS[env_label]["footprint"])
+            self._publish_footprint_polygon(ARM_CONFIGS[env_label]["footprint"])
+            self.applied_envelope_label = env_label
 
         # Command the arm when the decision changes, OR when a previously
-        # commanded target was never physically reached. Without the second
-        # condition a dropped goal or a stale cross-episode target leaves the
-        # arm extended for the rest of the run with no retry.
-        # Arm chatter guard. r_width crossing a single tree split (6.05 m) flips
-        # the leaf between a tucked and a carry action, and while rotating in place
-        # that boundary is crossed repeatedly. Require the new label to persist and
-        # a minimum dwell since the last switch before committing 4 s of arm motion.
+        # commanded target was never physically reached.
         if arm_label != self.target_arm_label:
             if arm_label == self.pending_arm_label:
                 self.pending_arm_count += 1
@@ -1168,7 +1203,14 @@ class OnlineCausalTunerNode(Node):
             self.pending_arm_label = None
             self.pending_arm_count = 0
 
-        persisted = self.pending_arm_count >= self.arm_persist_ticks
+        # Retraction (carry -> tucked) is commanded immediately (1st tick).
+        # Extension (tucked -> carry) requires 2 consecutive ticks (0.4 s) in open space.
+        if arm_label == "tucked" and self.target_arm_label == "carry":
+            persisted = True
+        elif arm_label == "carry" and self.target_arm_label == "tucked":
+            persisted = self.pending_arm_count >= 2
+        else:
+            persisted = self.pending_arm_count >= self.arm_persist_ticks
         dwell_ok = (sim_now - self.last_arm_switch_time) >= self.arm_switch_dwell
 
         transition_done = sim_now >= self.arm_transition_until_time
@@ -1201,6 +1243,7 @@ class OnlineCausalTunerNode(Node):
         self.decision_log.append({
             "t": sim_now,
             "risk": list(self.current_risk_vector or []),
+            "risk_measured": list(self.current_risk_vector or []),
             "risk_forecast": list(getattr(self, "last_forecast_risk", [])),
             "speed_limit_pct": speed_limit_pct,
             "vx_std": vx_std,
@@ -1209,6 +1252,7 @@ class OnlineCausalTunerNode(Node):
             "path_align_weight": path_align_weight,
             "inflation": inflation,
             "arm_target": arm_label,
+            "arm_preferred": getattr(self, "preferred_arm_label", None),
             "arm_verified": self.verified_arm_label,
             "envelope_applied": self.applied_envelope_label,
             "p_risk": float(target_config.get("p_risk", float("nan"))),
@@ -1221,6 +1265,12 @@ class OnlineCausalTunerNode(Node):
             "out_of_support": bool(target_config.get("out_of_support", False)),
             "terminal_phase": bool(self.in_terminal_phase),
             "d_goal": self._distance_to_goal(),
+            "u_by_speed": target_config.get("u_by_speed"),
+            "u_by_inflation": target_config.get("u_by_inflation"),
+            "u_by_costw": target_config.get("u_by_costw"),
+            "inf_ceiling": target_config.get("inf_ceiling"),
+            "n_tied_at_optimum": target_config.get("n_tied_at_optimum"),
+            "n_safe_candidates": target_config.get("n_safe_candidates"),
         })
 
         target_config["_applied_speed_limit_pct"] = speed_limit_pct
@@ -1237,6 +1287,11 @@ class OnlineCausalTunerNode(Node):
         """
         self.total_samples = 0
         self.carry_samples = 0
+        self.carry_distance_m = 0.0
+        self.total_distance_m = 0.0
+        self.last_odom_pose = None
+        self.pending_inflation = None
+        self.pending_inflation_count = 0
         self.n_arm_switches = 0
         self.n_arm_retries = 0
         self.n_config_switches = 0
@@ -1255,6 +1310,7 @@ class OnlineCausalTunerNode(Node):
         if verified is not None:
             self.current_arm_label = verified
         self.target_arm_label = self.current_arm_label
+        self.preferred_arm_label = "carry"
         self.verified_arm_label = verified
         self.arm_transition_until_time = 0.0
         self.last_applied_config = None
