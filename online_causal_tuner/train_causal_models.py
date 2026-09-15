@@ -5,8 +5,8 @@ Offline Causal Model Training Pipeline for the Online Causal Tuner.
 Trains THREE models from Campaign A RCT data:
 
   1. Safety      P(Y^H = 1 | do(C=c), R=r)          logistic
-  2. Feasibility P(stall  | do(C=c), R=r)           logistic   <-- NEW (hurdle part 1)
-  3. Speed       E[J^H | moves, do(C=c), R=r]       ridge      <-- NEW (hurdle part 2)
+  2. Feasibility P(stall  | do(C=c), R=r)           logistic    (hurdle part 1)
+  3. Speed       E[J^H | moves, do(C=c), R=r]       ridge       (hurdle part 2)
 
 Expected progress is then  E[J^H] = (1 - P(stall)) * E[J^H | moves].
 
@@ -128,9 +128,13 @@ class CausalInteractionTransformer(BaseEstimator, TransformerMixin):
         ("param__controller_server__speed_limit_pct", "risk__r_width"),
         ("param__controller_server__speed_limit_pct", "risk__r_curve"),
         ("param__controller_server__speed_limit_pct", "risk__r_clear"),
+        ("param__controller_server__FollowPath.vx_std", "risk__r_width"),
+        ("param__controller_server__FollowPath.vx_std", "risk__r_ttc"),
+        ("param__controller_server__FollowPath.vx_std", "risk__r_dens"),
         ("param__controller_server__FollowPath.vx_std", "risk__r_clear"),
         ("param__controller_server__FollowPath.vx_std", "risk__r_curve"),
         ("param__controller_server__FollowPath.ConstraintCritic.cost_weight", "risk__r_min"),
+        ("param__controller_server__FollowPath.ConstraintCritic.cost_weight", "risk__r_curve"),
         ("param__controller_server__FollowPath.CostCritic.cost_weight", "risk__r_min"),
         ("param__controller_server__FollowPath.CostCritic.cost_weight", "risk__r_dens"),
         ("param__controller_server__FollowPath.PathAlignCritic.cost_weight", "risk__r_curve"),
@@ -147,6 +151,8 @@ class CausalInteractionTransformer(BaseEstimator, TransformerMixin):
     CONFIG_CROSS = [
         ("param__controller_server__speed_limit_pct", FOOTPRINT_KEY),
         ("param__local_costmap__inflation_layer.inflation_radius", FOOTPRINT_KEY),
+        ("param__controller_server__FollowPath.ConstraintCritic.cost_weight", "param__controller_server__speed_limit_pct"),
+        ("param__controller_server__FollowPath.ConstraintCritic.cost_weight", "param__controller_server__FollowPath.vx_std"),
     ]
 
     def __init__(self, feature_cols=None):

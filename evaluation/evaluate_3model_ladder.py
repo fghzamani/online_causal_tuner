@@ -48,6 +48,14 @@ import math
 import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score, brier_score_loss, r2_score
+
+# Try importing from the package, fallback to local path append if needed
+try:
+    from online_causal_tuner.train_causal_models import RISK_FEATURE_KEYS, PARAM_KEYS
+except ImportError:
+    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+    from online_causal_tuner.train_causal_models import RISK_FEATURE_KEYS, PARAM_KEYS
+
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import GroupKFold
@@ -91,8 +99,17 @@ def extract_features_and_groups(data_path: str):
     else:
         groups = np.arange(len(df)) // 15
 
-    risk_cols = [c for c in df.columns if c.startswith("risk__")]
-    param_cols = [c for c in df.columns if c.startswith("param__")]
+    # Extract fixed standardized columns, defaulting missing ones to 0.0
+    for col in RISK_FEATURE_KEYS:
+        if col not in df.columns:
+            df[col] = 0.0
+    for col in PARAM_KEYS:
+        if col not in df.columns:
+            df[col] = 0.0
+
+    risk_cols = [col for col in RISK_FEATURE_KEYS]
+    param_cols = [col for col in PARAM_KEYS]
+
 
     if "y_h" in df.columns:
         y_safe = pd.to_numeric(df["y_h"], errors="coerce").fillna(0).astype(int).values
@@ -139,8 +156,9 @@ def extract_features_and_groups(data_path: str):
     c_w = get_vec("wz_max")
     c_inf = get_vec("inflation_radius")
     c_obs = get_vec("cost_weight")
-    c_hor = get_vec("time_horizon")
+    c_hor = get_vec("time_steps")
     c_arm = get_vec("footprint")
+
 
     r_ttc = get_vec("r_ttc")
     r_width = get_vec("r_width")

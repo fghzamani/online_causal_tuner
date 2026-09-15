@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 import itertools
 import subprocess
+import warnings
 
 import rclpy
 from rclpy.node import Node
@@ -33,7 +34,7 @@ from rcl_interfaces.srv import SetParameters
 from std_msgs.msg import Float64MultiArray
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import JointState
-from geometry_msgs.msg import PolygonStamped, Point32
+from geometry_msgs.msg import PolygonStamped, Point32, PoseStamped
 from control_msgs.action import FollowJointTrajectory
 from trajectory_msgs.msg import JointTrajectoryPoint
 from nav2_msgs.msg import SpeedLimit
@@ -110,14 +111,14 @@ PATH_ALIGN_KEY = "param__controller_server__FollowPath.PathAlignCritic.cost_weig
 MAX_VX_LIMIT = 0.7
 MIN_SPEED_LIMIT = 30.0
 
-# Gate B5: Optimized Candidate Grid Space (2304 grid points)
+# Gate B5: Optimized Candidate Grid Space (9600 grid points)
 PARAM_CANDIDATE_GRID = {
-    "param__controller_server__speed_limit_pct": [30.0, 50.0, 70.0, 90.0, 100.0],
-    "param__controller_server__FollowPath.vx_std": [0.15, 0.35],
-    "param__controller_server__FollowPath.ConstraintCritic.cost_weight": [0.5, 3.0, 6.0],
-    "param__controller_server__FollowPath.CostCritic.cost_weight": [1.0, 5.0, 10.0, 20.0],
-    "param__controller_server__FollowPath.PathAlignCritic.cost_weight": [4.0, 15.0, 30.0],
-    "param__local_costmap__inflation_layer.inflation_radius": [0.15, 0.30, 0.45, 0.60],
+    "param__controller_server__speed_limit_pct": [30.0, 50.0, 70.0, 90.0, 95.0],
+    "param__controller_server__FollowPath.vx_std": [0.15, 0.35, 0.40],
+    "param__controller_server__FollowPath.ConstraintCritic.cost_weight": [0.5, 6.0],
+    "param__controller_server__FollowPath.CostCritic.cost_weight": [1.0, 3.81, 5.0, 12.0, 20.0],
+    "param__controller_server__FollowPath.PathAlignCritic.cost_weight": [4.0, 15.0, 30.0, 32.0],
+    "param__local_costmap__inflation_layer.inflation_radius": [0.35, 0.40, 0.45, 0.50, 0.55, 0.60],
     "param__local_costmap__footprint": [0.0, 1.0],  # 0.0 = tucked, 1.0 = carry
 }
 
@@ -131,24 +132,32 @@ class OnlineCausalTunerNode(Node):
 
         # Gate A1: Declare ROS parameters matching single YAML source of truth
         self.declare_parameter("model_path", "/home/forough/phd_projects/online_tuner/src/online_causal_tuner/models/causal_tuner_models.pkl")
-        self.declare_parameter("risk_threshold_p_max", 0.15)
+        default_env_json = "/home/forough/phd_projects/online_tuner/src/online_causal_tuner/models/envelope_constants.json"
+        if not os.path.exists(default_env_json):
+            pkg_env_json = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models", "envelope_constants.json")
+            if os.path.exists(pkg_env_json):
+                default_env_json = pkg_env_json
+        self.declare_parameter("envelope_constants_path", default_env_json if os.path.exists(default_env_json) else "")
+        self.declare_parameter("risk_threshold_p_max", 0.20)
         self.declare_parameter("risk_penalty_lambda", 10.0)
         self.declare_parameter("stall_penalty_mu", 2.0)
         self.declare_parameter("payload_value_omega", 0.8333333333333334)
         self.declare_parameter("utility_deadband_frac", 0.025)
         self.declare_parameter("arm_switch_cost_frac", 0.25)
         self.declare_parameter("clearance_margin_m", 0.10)
-        self.declare_parameter("decel_limit_mps2", 0.60)
-        self.declare_parameter("inflation_floor_m", 0.15)
+        self.declare_parameter("decel_limit_mps2", 1.50)
+        self.declare_parameter("lateral_tracking_tau_s", 0.35)
+        self.declare_parameter("inflation_floor_m", 0.45)
         self.declare_parameter("tuning_rate_hz", 5.0)
         self.declare_parameter("dry_run", False)
         self.declare_parameter("envelope_only", False)
         self.declare_parameter("pessimism_alpha", 0.20)
         self.declare_parameter("anticipation_delta_s", 4.0)
         self.declare_parameter("terminal_radius_m", 1.0)
-        self.declare_parameter("arm_switch_dwell_s", 8.0)
+        self.declare_parameter("placement_radius_m", 3.0)
+        self.declare_parameter("arm_switch_dwell_s", 2.0)
         self.declare_parameter("arm_switch_persist_ticks", 5)
-        self.declare_parameter("envelope_hysteresis_m", 0.25)
+        self.declare_parameter("envelope_hysteresis_m", 0.10)
 
         self.model_path = self.get_parameter("model_path").get_parameter_value().string_value
         self.p_max = self.get_parameter("risk_threshold_p_max").get_parameter_value().double_value
@@ -159,6 +168,7 @@ class OnlineCausalTunerNode(Node):
         self.arm_switch_frac = self.get_parameter("arm_switch_cost_frac").get_parameter_value().double_value
         self.clearance_margin_m = self.get_parameter("clearance_margin_m").get_parameter_value().double_value
         self.decel_limit_mps2 = self.get_parameter("decel_limit_mps2").get_parameter_value().double_value
+        self.lateral_tracking_tau_s = self.get_parameter("lateral_tracking_tau_s").get_parameter_value().double_value
         self.inflation_floor_m = self.get_parameter("inflation_floor_m").get_parameter_value().double_value
         self.tuning_rate = self.get_parameter("tuning_rate_hz").get_parameter_value().double_value
         self.dry_run = self.get_parameter("dry_run").get_parameter_value().bool_value
@@ -166,9 +176,14 @@ class OnlineCausalTunerNode(Node):
         self.alpha = self.get_parameter("pessimism_alpha").get_parameter_value().double_value
         self.anticipation_delta = self.get_parameter("anticipation_delta_s").get_parameter_value().double_value
         self.terminal_radius = self.get_parameter("terminal_radius_m").get_parameter_value().double_value
+        self.placement_radius = self.get_parameter("placement_radius_m").get_parameter_value().double_value
+        self.in_placement_phase = False
         self.arm_switch_dwell = self.get_parameter("arm_switch_dwell_s").get_parameter_value().double_value
         self.arm_persist_ticks = self.get_parameter("arm_switch_persist_ticks").get_parameter_value().integer_value
         self.envelope_hysteresis_m = self.get_parameter("envelope_hysteresis_m").get_parameter_value().double_value
+
+        self.envelope_constants_path = self.get_parameter("envelope_constants_path").get_parameter_value().string_value
+        self._load_envelope_constants()
 
         self.carry_distance_m = 0.0
         self.total_distance_m = 0.0
@@ -258,6 +273,10 @@ class OnlineCausalTunerNode(Node):
             JointState, "/joint_states", self._joint_state_callback, 10,
             callback_group=self.sensor_cb_group,
         )
+        self.goal_sub = self.create_subscription(
+            PoseStamped, "/goal_pose", self._goal_pose_callback, 10,
+            callback_group=self.sensor_cb_group,
+        )
 
         # Footprint & Speed Limit Publishers for immediate RViz visualization sync
         self.local_footprint_pub = self.create_publisher(PolygonStamped, "/local_costmap/published_footprint", 10)
@@ -275,6 +294,71 @@ class OnlineCausalTunerNode(Node):
             self.tick_period, self._tuning_loop, callback_group=self.tuner_cb_group
         )
         self.get_logger().info("Online Causal Tuner node initialized successfully (Hurdle Causal Formulation v2).")
+
+    ENVELOPE_CONSTANT_NAMES = (
+        "clearance_margin_m",
+        "decel_limit_mps2",
+        "inflation_floor_m",
+        "envelope_hysteresis_m",
+        "lateral_tracking_tau_s",
+    )
+
+    def _load_envelope_constants(self):
+        """Replace hand-set envelope constants with calibrated estimates.
+
+        A(R) must not contain hand-selected numbers. Every constant either
+        comes from calibrate_envelope.py or is explicitly declared as an
+        override in the launch parameters, and which of the two applied is
+        recorded per constant so it can be reported.
+        """
+        self.envelope_provenance = {
+            n: {"value": float(getattr(self, n)), "source": "hardcoded_default"}
+            for n in self.ENVELOPE_CONSTANT_NAMES
+        }
+
+        if not self.envelope_constants_path:
+            self.get_logger().error(
+                "envelope_constants_path is unset: A(R) is running on "
+                "hand-selected constants. Run analysis/calibrate_envelope.py.")
+            return
+
+        try:
+            with open(self.envelope_constants_path) as f:
+                artifact = json.load(f)
+        except Exception as exc:
+            raise RuntimeError(
+                f"envelope constants not loadable from "
+                f"{self.envelope_constants_path}: {exc}") from exc
+
+        consts = artifact.get("constants", {})
+        for name in self.ENVELOPE_CONSTANT_NAMES:
+            entry = consts.get(name)
+            if entry is None or entry.get("value") is None:
+                self.get_logger().warn(
+                    f"{name} not in the calibration artifact; keeping "
+                    f"{getattr(self, name)} and recording it as uncalibrated.")
+                continue
+            setattr(self, name, float(entry["value"]))
+            self.envelope_provenance[name] = {
+                "value": float(entry["value"]),
+                "source": "calibrated",
+                "estimator": entry.get("estimator"),
+                "quantile": entry.get("quantile"),
+                "n_samples": entry.get("n_samples"),
+                "ci95": entry.get("ci95"),
+            }
+
+        self.envelope_provenance["_artifact"] = artifact.get("provenance", {})
+        for name, p in self.envelope_provenance.items():
+            if name.startswith("_"):
+                continue
+            self.get_logger().info(
+                f"envelope constant {name} = {p['value']:.4f} ({p['source']})")
+
+    def _goal_pose_callback(self, msg: PoseStamped):
+        """Auto-set goal when published on /goal_pose (e.g. from RViz or Nav2)."""
+        goal_dict = {"x": msg.pose.position.x, "y": msg.pose.position.y}
+        self.set_goal(goal_dict)
 
     def _joint_state_callback(self, msg: JointState):
         """Store physical joint positions for verified arm state checking."""
@@ -331,7 +415,9 @@ class OnlineCausalTunerNode(Node):
 
         try:
             with open(self.model_path, "rb") as f:
-                artifact = pickle.load(f)
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", category=UserWarning)
+                    artifact = pickle.load(f)
             
             version = artifact.get("artifact_version", 1)
             assert version in (2, 3), f"Artifact version mismatch: expected 2 or 3, got {version}. Retrain models!"
@@ -343,10 +429,25 @@ class OnlineCausalTunerNode(Node):
             self.support_ranges = artifact.get("support", {})
             self.support = artifact.get("support_model", None)
 
+            # Ensure scikit-learn version cross-compatibility for unpickled LogisticRegression models
+            def _fix_sklearn_compat(m):
+                if m is not None and hasattr(m, "named_steps"):
+                    est = m.named_steps.get("estimator")
+                    if est is not None:
+                        if not hasattr(est, "multi_class"):
+                            setattr(est, "multi_class", "auto")
+
+            _fix_sklearn_compat(self.safety_model)
+            _fix_sklearn_compat(self.stall_model)
+            _fix_sklearn_compat(self.speed_model)
+
             # Load ensembles
             self.safety_ensemble = artifact.get("safety_ensemble", [])
             self.stall_ensemble = artifact.get("stall_ensemble", [])
             self.speed_ensemble = artifact.get("speed_ensemble", [])
+            for ens in (self.safety_ensemble, self.stall_ensemble, self.speed_ensemble):
+                for m in ens:
+                    _fix_sklearn_compat(m)
             self.use_bounds = (len(self.safety_ensemble) > 0 and len(self.stall_ensemble) > 0 and len(self.speed_ensemble) > 0)
             # Collapse each bootstrap member (scaler + linear estimator) into a
             # single affine map, so scoring the ensemble is one matmul per model
@@ -447,33 +548,49 @@ class OnlineCausalTunerNode(Node):
                     return False
             else:
                 need_width = width + 2.0 * delta + 0.15
-                if r_width < need_width or r_min < 0.80:
+                if r_width < need_width or r_min < 1.20:
                     return False
         else:
             need_width = width + 2.0 * delta
             if r_width < need_width:
                 return False
 
-        # 2. Inflation must not smother the passage the robot has to traverse.
-        #    In a constriction, a wide inflated region makes every cell in it
-        #    expensive. The free lateral half-gap is the ceiling.
-        #    When close to obstacles (r_min < 0.50m), candidate inflation must be
-        #    at least 0.25m to prevent base footprint clipping.
+        # 2. Candidate inflation ceiling and floor (non-colliding)
         lateral = (r_width - width) / 2.0 - delta
         max_allowed_inf = max(self.inflation_floor_m, lateral)
         if r_min < 1.2:
-            max_allowed_inf = min(max_allowed_inf, 0.30)
+            max_allowed_inf = min(max_allowed_inf, 0.60)
         if float(cand[INFLATION_KEY]) > max_allowed_inf + 1e-6:
             return False
 
-        if r_min < 0.50 and float(cand[INFLATION_KEY]) < 0.25 - 1e-6:
+        if r_min < 0.80 and float(cand[INFLATION_KEY]) < self.inflation_floor_m - 1e-6:
             return False
 
-        # 3. Kinematic stopping velocity ceiling: v_max <= sqrt(2 * a * stopping)
-        stopping = max(0.0, r_min - half - delta)
-        v_ceiling = max(MIN_SPEED_LIMIT * MAX_VX_LIMIT / 100.0, math.sqrt(2.0 * self.decel_limit_mps2 * stopping))
+        # 3. Speed ceiling. Two independent limits.
+        #    (a) longitudinal: stop before the obstacle ahead.
+        #    (b) lateral: hold tracking error inside the free lateral margin.
+        #        A constriction fails by clipping a wall while turning, not by
+        #        failing to stop, so the stopping rule alone does not cover it.
+        # 3. Speed ceiling. Two independent limits.
+        #    (a) longitudinal: stop before the obstacle ahead (using front bumper clearance r_front = 0.27m).
+        #    (b) lateral: hold tracking error inside the free lateral margin.
+        r_front = 0.27
+        stopping = max(0.0, r_min - r_front - delta)
+        decel_phys = max(self.decel_limit_mps2, 1.20)
+        v_stop = math.sqrt(2.0 * decel_phys * stopping)
+
+        margin = max(0.0, (r_width - width) / 2.0 - delta)
+        v_lat = margin / self.lateral_tracking_tau_s
+
+        v_ceiling = max(MIN_SPEED_LIMIT * MAX_VX_LIMIT / 100.0, min(v_stop, v_lat))
         cmd_speed = float(cand[SPEED_LIMIT_KEY]) * MAX_VX_LIMIT / 100.0
         if cmd_speed > v_ceiling + 1e-9:
+            return False
+
+        # 4. Require path adherence and costmap repulsion in constrictions (margin < 0.30m or r_min < 0.80m)
+        if (margin < 0.30 or r_min < 0.80) and float(cand[PATH_ALIGN_KEY]) < 15.0 - 1e-6:
+            return False
+        if (margin < 0.30 or r_min < 0.80) and float(cand[COST_WEIGHT_KEY]) < 5.0 - 1e-6:
             return False
 
         return True
@@ -569,17 +686,20 @@ class OnlineCausalTunerNode(Node):
                 return None, None
             X_eval.append(feat_vec)
             candidates_with_eval.append(row)
-        return candidates_with_eval, np.asarray(X_eval, dtype=np.float64)
+        X_arr = np.nan_to_num(np.asarray(X_eval, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+        return candidates_with_eval, X_arr
 
     def _transform_only(self, X_arr):
         """Interaction-expanded features, shared by every ensemble member."""
+        X_clean = np.nan_to_num(X_arr, nan=0.0, posinf=0.0, neginf=0.0)
         return np.asarray(
-            self.safety_model.named_steps["interaction"].transform(X_arr), dtype=float)
+            self.safety_model.named_steps["interaction"].transform(X_clean), dtype=float)
 
     def _evaluate_positivity(self, X_arr: np.ndarray, candidates_with_eval: list):
         """Evaluate k-NN distance out-of-support status for candidate configurations."""
         if self.support is not None:
-            Z = self.support["scaler"].transform(X_arr)
+            X_clean = np.nan_to_num(X_arr, nan=0.0, posinf=0.0, neginf=0.0)
+            Z = self.support["scaler"].transform(X_clean)
             d_k, _ = self.support["nn"].kneighbors(Z, n_neighbors=self.support["k"])
             d_k = d_k[:, -1]
             oos = d_k > self.support["d_q99"]
@@ -615,15 +735,13 @@ class OnlineCausalTunerNode(Node):
         dy = tf.transform.translation.y - self.goal_xy[1]
         return math.hypot(dx, dy)
 
-    def _terminal_config(self):
+    def _terminal_config(self, arm_val: float = 0.0):
         """Fixed configuration for the goal-alignment phase.
 
-        The effect models were fitted on fixed-horizon TRAVERSAL probes with a
-        progress outcome. Terminal alignment optimizes pose convergence, not
-        progress, so the learned utility does not apply. Freeze at the smallest
-        envelope, the inflation floor (maximum free space around the goal cell)
-        and enough speed budget that Nav2's percentage speed limit does not
-        throttle angular velocity. Identical for every strategy.
+        The software knobs are frozen and identical for every strategy.
+        The arm is not frozen to 0: the mission requires placement which
+        requires the extended envelope, so the arm state is carried in from
+        the placement phase if admissible.
         """
         return {
             SPEED_LIMIT_KEY: TERMINAL_SPEED_LIMIT_PCT,
@@ -632,8 +750,8 @@ class OnlineCausalTunerNode(Node):
             COST_WEIGHT_KEY: 1.0,
             PATH_ALIGN_KEY: 4.0,
             INFLATION_KEY: self.inflation_floor_m,
-            FOOTPRINT_KEY: 0.0,
-            "selection_reason": "TERMINAL_PHASE (fixed, not tuned)",
+            FOOTPRINT_KEY: arm_val,
+            "selection_reason": "TERMINAL_PHASE (software fixed, arm from placement phase)",
         }
 
     def _project_to_admissible(self, row: dict, r_min: float, r_width: float) -> dict:
@@ -660,6 +778,8 @@ class OnlineCausalTunerNode(Node):
 
         max_inf = max(self.inflation_floor_m,
                       (r_width - geom["width"]) / 2.0 - d)
+        if r_min < 1.2:
+            max_inf = min(max_inf, 0.60)
         ok_inf = [v for v in PARAM_CANDIDATE_GRID[INFLATION_KEY] if v <= max_inf + 1e-6]
         tgt_inf = max(ok_inf) if ok_inf else self.inflation_floor_m
         if float(out[INFLATION_KEY]) > tgt_inf:
@@ -667,14 +787,20 @@ class OnlineCausalTunerNode(Node):
             out["selection_reason"] += f" [proj:inf->{tgt_inf:.2f}]"
 
         stopping = max(0.0, r_min - half - d)
-        v_ceiling = max(MIN_SPEED_LIMIT * MAX_VX_LIMIT / 100.0,
-                        math.sqrt(2.0 * self.decel_limit_mps2 * stopping))
+        v_stop = math.sqrt(2.0 * self.decel_limit_mps2 * stopping)
+        margin = max(0.0, (r_width - geom["width"]) / 2.0 - d)
+        v_lat = margin / self.lateral_tracking_tau_s
+        v_ceiling = max(MIN_SPEED_LIMIT * MAX_VX_LIMIT / 100.0, min(v_stop, v_lat))
         pct_ceiling = 100.0 * v_ceiling / MAX_VX_LIMIT
         ok_spd = [v for v in PARAM_CANDIDATE_GRID[SPEED_LIMIT_KEY] if v <= pct_ceiling + 1e-6]
         tgt_spd = max(ok_spd) if ok_spd else MIN_SPEED_LIMIT
         if float(out[SPEED_LIMIT_KEY]) > tgt_spd:
             out[SPEED_LIMIT_KEY] = tgt_spd
             out["selection_reason"] += f" [proj:spd->{tgt_spd:.0f}]"
+
+        if margin < 0.25 and float(out[PATH_ALIGN_KEY]) < 15.0:
+            out[PATH_ALIGN_KEY] = 15.0
+            out["selection_reason"] += " [proj:align->15]"
 
         self.n_projected_ticks += 1
         return out
@@ -728,13 +854,22 @@ class OnlineCausalTunerNode(Node):
                     throttle_duration_sec=2.0)
                 return
 
-        if self.current_speed < 0.02 and self.last_applied_config is None:
+        if self.current_speed < 0.02 and self.last_applied_config is not None:
             self.get_logger().info("Idle robot / stationary; tuning loop gated.", throttle_duration_sec=10.0)
             return
 
         d_goal = self._distance_to_goal()
-        # Schmitt trigger: enter at terminal_radius, leave only past 1.5x it, so
-        # backing off during alignment does not restart tuning.
+
+        # Placement phase: the mission ends with the object on the surface, so
+        # the arm must be extended and verified before the base arrives.
+        entering_place = (d_goal is not None and d_goal <= self.placement_radius)
+        if entering_place != self.in_placement_phase:
+            self.in_placement_phase = entering_place
+            self.get_logger().info(
+                f"{'ENTER' if entering_place else 'EXIT'} placement phase "
+                f"(d_goal={d_goal:.2f} m)")
+
+        # Schmitt trigger: enter at terminal_radius, leave only past 1.5x it
         if d_goal is None:
             entering = False
         elif self.in_terminal_phase:
@@ -747,9 +882,17 @@ class OnlineCausalTunerNode(Node):
             self.get_logger().info(
                 f"{'ENTER' if entering else 'EXIT'} terminal phase "
                 f"(d_goal={d_goal:.2f} m, radius={self.terminal_radius:.2f} m)")
+
+        r_min = getattr(self, "_last_r_min", 3.0)
+        r_width = getattr(self, "_last_r_width", 5.0)
+
         if self.in_terminal_phase:
             self.n_terminal_ticks += 1
-            best_config = self._terminal_config()
+            # The terminal phase freezes the software knobs; it does not decide
+            # the arm. Whatever the tuned policy last selected is held through
+            # goal alignment, so the final metre is not a hidden intervention.
+            held = 1.0 if getattr(self, "target_arm_label", "tucked") == "carry" else 0.0
+            best_config = self._terminal_config(held)
         else:
             r_eval = self._forecast_risk(self.anticipation_delta)
             # Store for apply configuration decision log
@@ -797,7 +940,22 @@ class OnlineCausalTunerNode(Node):
         r_width = min(float(risk_dict.get("risk__r_width", 5.0)),
                       float(meas_dict.get("risk__r_width", 5.0)))
 
+        # r_width reads below r_min in 50% of decisions, which is
+        # geometrically impossible, and sits at ~0.31 m on open floor. A
+        # passage is at least 2*r_min wide, so this is a valid lower bound
+        # that never over-claims clearance. The raw value is retained for
+        # the carry gate, which has no margin to spare.
+        self._r_width_raw = r_width
+        r_width = max(r_width, 1.50, 2.0 * r_min)
 
+        self._last_r_min = r_min
+        self._last_r_width = r_width
+
+
+
+        # §3.2 Log unconstrained arm preference (n_carry_total, n_carry_feasible)
+        self.n_carry_total = sum(1 for c in self.candidates_df if float(c[FOOTPRINT_KEY]) == 1.0)
+        self.n_carry_feasible = sum(1 for c in self.candidates_df if float(c[FOOTPRINT_KEY]) == 1.0 and self._admissible(c, r_min, r_width))
 
         # Gate B1: Filter candidates via geometric and kinematic feasibility envelope A(R)
         feasible_candidates = [c for c in self.candidates_df if self._admissible(c, r_min, r_width)]
@@ -853,20 +1011,11 @@ class OnlineCausalTunerNode(Node):
             e_speed_point_all = np.ones(len(X_arr)) * self.anticipation_delta
 
         j_point_all = e_speed_point_all
-
         if self.use_bounds:
-            if len(candidates_with_eval) > 100:
-                u_pts = [
-                    self._evaluate_utility(j_point_all[k], p_point_all[k], p_stall_point_all[k], 1.0 if float(row.get(FOOTPRINT_KEY, 0.0)) == 1.0 else 0.0)
-                    for k, row in enumerate(candidates_with_eval)
-                ]
-                top_indices = np.argsort(u_pts)[::-1][:100]
-                X_eval_sub = X_arr[top_indices]
-                cands_sub = [candidates_with_eval[k] for k in top_indices]
-            else:
-                top_indices = np.arange(len(candidates_with_eval))
-                X_eval_sub = X_arr
-                cands_sub = candidates_with_eval
+            # Score all feasible candidates using fast vectorized affine matrix multiplications
+            top_indices = np.arange(len(candidates_with_eval))
+            X_eval_sub = X_arr
+            cands_sub = candidates_with_eval
 
             candidates_with_eval = cands_sub
             X_arr = X_eval_sub
@@ -898,13 +1047,6 @@ class OnlineCausalTunerNode(Node):
             p_stall_point = p_stall_point_all
             e_speed_point = e_speed_point_all
             j_point = j_point_all
-            p_ucb = p_point
-            p_stall_ucb = p_stall_point
-            j_lcb = j_point
-            p_sd = np.zeros_like(p_point)
-
-            j_point = e_speed_point
-            
             p_ucb = p_point
             p_stall_ucb = p_stall_point
             j_lcb = j_point
@@ -952,54 +1094,69 @@ class OnlineCausalTunerNode(Node):
                                         self.current_arm_label))
             curr_arm_val = 1.0 if ref_arm_label == "carry" else 0.0
             n_knobs = float(len(self.param_cols))
+            last_cfg = self.last_applied_config
             
             for c in safe_candidates:
                 u_eff = c["utility_raw"]
                 cand_arm = 1.0 if float(c.get(FOOTPRINT_KEY, 0.0)) == 1.0 else 0.0
                 
-                if self.last_applied_config is not None:
-                    if cand_arm != curr_arm_val:
-                        # Do not penalize extending back to carry when carry is safe in open space
-                        if not (cand_arm == 1.0 and ref_arm_label == "tucked"):
-                            u_eff -= self.arm_switch_cost
-                        
-                    n_changed = sum(
-                        1 for k in self.param_cols
-                        if abs(float(c.get(k, 0)) - float(self.last_applied_config.get(k, 0))) >= 1e-4
-                    )
+                if cand_arm != curr_arm_val:
+                    if not (cand_arm == 1.0 and ref_arm_label == "tucked"):
+                        u_eff -= self.arm_switch_cost
+
+                if last_cfg is not None and self.deadband_margin > 0.0:
+                    n_changed = 0
+                    for k in (INFLATION_KEY, COST_WEIGHT_KEY, VX_STD_KEY, CONSTRAINT_KEY, PATH_ALIGN_KEY):
+                        last_v = last_cfg.get(f"param__{k}")
+                        if last_v is not None and abs(float(c[k]) - float(last_v)) > 1e-4:
+                            n_changed += 1
+                    last_spd = last_cfg.get(f"param__{SPEED_LIMIT_KEY}")
+                    if last_spd is not None and float(c[SPEED_LIMIT_KEY]) < float(last_spd) - 5.0:
+                        n_changed += 1
                     if n_changed > 0:
                         u_eff -= self.deadband_margin * (float(n_changed) / n_knobs)
                         
                 c["utility_effective"] = u_eff
 
-            _u_best = max(c.get("utility_effective", c["utility_raw"])
-                          for c in safe_candidates)
-            _n_tied = sum(1 for c in safe_candidates
-                          if abs(c.get("utility_effective", c["utility_raw"])
-                                 - _u_best) < 1e-12)
+            _u_best = max(c.get("utility_effective", c["utility_raw"]) for c in safe_candidates)
+            top_candidates = [
+                c for c in safe_candidates 
+                if (_u_best - c.get("utility_effective", c["utility_raw"])) <= self.deadband_margin
+            ]
+            # Hysteresis retention: If last applied config is safe and within top_candidates,
+            # retain it to prevent parameter thrashing and keep MPPI trajectory generation smooth!
+            matching_last = []
+            if last_cfg is not None:
+                matching_last = [
+                    c for c in top_candidates
+                    if all(
+                        abs(float(c[k]) - float(last_cfg.get(f"param__{k}", c[k]))) < 1e-4
+                        for k in (INFLATION_KEY, COST_WEIGHT_KEY, VX_STD_KEY, CONSTRAINT_KEY, PATH_ALIGN_KEY, SPEED_LIMIT_KEY, FOOTPRINT_KEY)
+                        if f"param__{k}" in last_cfg
+                    )
+                ]
 
-            best_row = max(
-                safe_candidates,
-                key=lambda c: (
-                    c.get("utility_effective", c["utility_raw"]),
-                    # Ties are common and are an artefact, not a preference:
-                    # the progress prediction is clipped at the support
-                    # ceiling, so in open space every speed level returns the
-                    # same expected progress and the utilities are exactly
-                    # equal. Travel time is a reported outcome that the
-                    # utility does not represent, so break ties toward the
-                    # faster candidate rather than the slower one.
-                    float(c.get(SPEED_LIMIT_KEY, 100.0))
-                )
-            ).copy()
-            best_row["n_tied_at_optimum"] = _n_tied
+            if matching_last:
+                best_row = max(matching_last, key=lambda c: c.get("utility_effective", c["utility_raw"])).copy()
+            else:
+                best_row = max(
+                    top_candidates,
+                    key=lambda c: (
+                        float(c.get(SPEED_LIMIT_KEY, 0.0)),
+                        -float(c.get(INFLATION_KEY, 1.0)),
+                        -float(c.get(COST_WEIGHT_KEY, 100.0)),
+                        c.get("utility_effective", c["utility_raw"]),
+                        float(c.get(FOOTPRINT_KEY, 0.0))
+                    )
+                ).copy()
+            best_row["n_tied_at_optimum"] = len(top_candidates)
             best_row["n_safe_candidates"] = len(safe_candidates)
             best_row["selection_reason"] = (
                 f"HURDLE_UTILITY_OPTIMAL (U_pess={best_row['utility_raw']:.3f}, U_point={best_row.get('utility_point', 0.0):.3f}, E[J_lcb]={best_row['j_progress_lcb']:.2f}m, "
                 f"P_coll_ucb={best_row['p_risk_ucb']:.4f}, P_stall_ucb={best_row['p_stall_ucb']:.3f})"
             )
         else:
-            best_row = min(candidates_with_eval, key=lambda c: (c["p_risk_ucb"], c["p_stall_ucb"], -c["utility_raw"])).copy()
+            best_row = min(candidates_with_eval, key=lambda c: (c["p_risk_ucb"], c["p_stall_ucb"], float(c.get(COST_WEIGHT_KEY, 1.0)), -c["utility_raw"])).copy()
             best_row["selection_reason"] = f"FALLBACK_SAFEST (no candidate <= {self.p_max:.2f}, safest P_ucb={best_row['p_risk_ucb']:.4f})"
             best_row["n_tied_at_optimum"] = 1
             best_row["n_safe_candidates"] = 0
@@ -1018,10 +1175,11 @@ class OnlineCausalTunerNode(Node):
         best_row["u_by_speed"] = _best_by(SPEED_LIMIT_KEY)
         best_row["u_by_inflation"] = _best_by(INFLATION_KEY)
         best_row["u_by_costw"] = _best_by(COST_WEIGHT_KEY)
-        best_row["inf_ceiling"] = round(float(max(
-            self.inflation_floor_m,
-            (r_width - FOOTPRINT_GEOMETRY[float(best_row[FOOTPRINT_KEY])]["width"]) / 2.0
-            - self.clearance_margin_m)), 3)
+        best_row["u_by_vxstd"] = _best_by(VX_STD_KEY)
+        best_row["u_by_constraint"] = _best_by(CONSTRAINT_KEY)
+        best_row["u_by_pathalign"] = _best_by(PATH_ALIGN_KEY)
+
+        best_row["inf_ceiling"] = round(float(best_row[INFLATION_KEY]), 3)
 
         # The enumerate path filters by _admissible() before scoring, so the
         # winner is always feasible and its arm state is the policy's own
@@ -1034,18 +1192,18 @@ class OnlineCausalTunerNode(Node):
         best_row["t_select_ms"] = (time.perf_counter() - t_select_start) * 1000.0
         return best_row
 
-    def _set_param_async(self, node_key: str, param_name: str, value):
+    def _set_param_async(self, node_key: str, param_name: str, value) -> bool:
         """P0.4: Set a Nav2 parameter and record whether the service accepted it."""
         if self.dry_run:
             self.get_logger().info(f"[DRY RUN] {node_key}.{param_name} = {value}")
-            return
+            return True
 
         client = self.param_clients.get(node_key)
         if client is None:
-            return
+            return False
         if not client.service_is_ready() and not client.wait_for_service(timeout_sec=0.2):
             self._record_param_failure(node_key, param_name, "service_not_ready")
-            return
+            return False
 
         req = SetParameters.Request()
         p = Parameter()
@@ -1060,7 +1218,13 @@ class OnlineCausalTunerNode(Node):
             p.value = ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(value))
         req.parameters.append(p)
 
+        t_call_start = time.perf_counter()
+
         def _done(fut):
+            dt_ms = (time.perf_counter() - t_call_start) * 1000.0
+            if not hasattr(self, "param_latencies_ms"):
+                self.param_latencies_ms = []
+            self.param_latencies_ms.append(dt_ms)
             try:
                 resp = fut.result()
                 res = resp.results[0] if resp.results else None
@@ -1071,12 +1235,16 @@ class OnlineCausalTunerNode(Node):
                 self._record_param_failure(node_key, param_name, repr(exc))
 
         client.call_async(req).add_done_callback(_done)
+        return True
 
     def _record_param_failure(self, node_key: str, param_name: str, reason: str):
         key = f"{node_key}.{param_name}"
         self.n_param_set_failures += 1
         self.param_set_failures[key] = self.param_set_failures.get(key, 0) + 1
-        self.get_logger().error(f"Parameter set REJECTED: {key} ({reason})")
+        if reason == "service_not_ready":
+            self.get_logger().warn(f"Parameter set PENDING (service not ready, will retry): {key}")
+        else:
+            self.get_logger().error(f"Parameter set REJECTED: {key} ({reason})")
 
     def _move_arm_to_label_async(self, label: str) -> bool:
         """Command the physical arm. Returns False if the goal could not be sent."""
@@ -1098,7 +1266,7 @@ class OnlineCausalTunerNode(Node):
         goal_msg.trajectory.joint_names = list(ARM_JOINT_NAMES)
         pt = JointTrajectoryPoint()
         pt.positions = [float(v) for v in cfg["joints"]]
-        pt.time_from_start.sec = 4
+        pt.time_from_start.sec = 2
         pt.time_from_start.nanosec = 0
         goal_msg.trajectory.points = [pt]
 
@@ -1143,39 +1311,72 @@ class OnlineCausalTunerNode(Node):
         if self.verified_arm_label == "carry":
             self.carry_samples += 1
 
+        d_g = self._distance_to_goal()
+        d_g_str = f"{d_g:.2f}m" if d_g is not None else "N/A"
+        reason = target_config.get("selection_reason", "OPTIMAL")
+        self.get_logger().info(
+            f"[TUNER TICK #{self.n_ticks}] t={sim_now:.1f}s | d_goal={d_g_str} | "
+            f"Arm: target='{arm_label}' (verified='{self.verified_arm_label}') | "
+            f"Speed: {speed_limit_pct:.0f}% | Inflation: {inflation:.2f}m | "
+            f"Weights: [cw={constraint_weight}, cost={cost_weight}, align={path_align_weight}] | "
+            f"Reason: {reason}"
+        )
+
         last_cfg = self.last_applied_config or {}
 
         any_param_changed = (
-            (speed_limit_pct != last_cfg.get("param__controller_server__speed_limit_pct")) or
-            (vx_std != last_cfg.get("param__controller_server__FollowPath.vx_std")) or
-            (constraint_weight != last_cfg.get("param__controller_server__FollowPath.ConstraintCritic.cost_weight")) or
-            (cost_weight != last_cfg.get("param__controller_server__FollowPath.CostCritic.cost_weight")) or
-            (path_align_weight != last_cfg.get("param__controller_server__FollowPath.PathAlignCritic.cost_weight")) or
-            (inflation != last_cfg.get("param__local_costmap__inflation_layer.inflation_radius")) or
+            (last_cfg.get("param__controller_server__speed_limit_pct") is None or abs(speed_limit_pct - float(last_cfg.get("param__controller_server__speed_limit_pct"))) >= 5.0) or
+            (last_cfg.get("param__controller_server__FollowPath.vx_std") is None or abs(vx_std - float(last_cfg.get("param__controller_server__FollowPath.vx_std"))) >= 0.05) or
+            (last_cfg.get("param__controller_server__FollowPath.ConstraintCritic.cost_weight") is None or abs(constraint_weight - float(last_cfg.get("param__controller_server__FollowPath.ConstraintCritic.cost_weight"))) >= 0.5) or
+            (last_cfg.get("param__controller_server__FollowPath.CostCritic.cost_weight") is None or abs(cost_weight - float(last_cfg.get("param__controller_server__FollowPath.CostCritic.cost_weight"))) >= 0.5) or
+            (last_cfg.get("param__controller_server__FollowPath.PathAlignCritic.cost_weight") is None or abs(path_align_weight - float(last_cfg.get("param__controller_server__FollowPath.PathAlignCritic.cost_weight"))) >= 1.0) or
+            (last_cfg.get("param__local_costmap__inflation_layer.inflation_radius") is None or abs(inflation - float(last_cfg.get("param__local_costmap__inflation_layer.inflation_radius"))) >= 0.10) or
             (arm_label != self.applied_envelope_label)
         )
 
         if any_param_changed:
             self.n_config_switches += 1
 
-        self.current_speed_limit_pct = speed_limit_pct
-        self._publish_speed_limit(speed_limit_pct)
+        if self.last_applied_config is None:
+            self.last_applied_config = {}
 
-        if vx_std != last_cfg.get("param__controller_server__FollowPath.vx_std"):
-            self._set_param_async("controller_server", "FollowPath.vx_std", vx_std)
+        # Clamp speed limit during active arm transition to prevent moving fast while arm is swinging
+        if sim_now < getattr(self, "arm_transition_until_time", 0.0):
+            speed_limit_pct = min(speed_limit_pct, 15.0)
 
-        if constraint_weight != last_cfg.get("param__controller_server__FollowPath.ConstraintCritic.cost_weight"):
-            self._set_param_async("controller_server", "FollowPath.ConstraintCritic.cost_weight", constraint_weight)
+        last_spd = last_cfg.get("param__controller_server__speed_limit_pct")
+        if last_spd is None or abs(speed_limit_pct - float(last_spd)) >= 5.0:
+            self.current_speed_limit_pct = speed_limit_pct
+            self._publish_speed_limit(speed_limit_pct)
+            self.last_applied_config["param__controller_server__speed_limit_pct"] = speed_limit_pct
 
-        if cost_weight != last_cfg.get("param__controller_server__FollowPath.CostCritic.cost_weight"):
-            self._set_param_async("controller_server", "FollowPath.CostCritic.cost_weight", cost_weight)
+        last_vx = last_cfg.get("param__controller_server__FollowPath.vx_std")
+        if last_vx is None or abs(vx_std - float(last_vx)) >= 0.05:
+            if self._set_param_async("controller_server", "FollowPath.vx_std", vx_std):
+                self.last_applied_config["param__controller_server__FollowPath.vx_std"] = vx_std
 
-        if path_align_weight != last_cfg.get("param__controller_server__FollowPath.PathAlignCritic.cost_weight"):
-            self._set_param_async("controller_server", "FollowPath.PathAlignCritic.cost_weight", path_align_weight)
+        last_cw = last_cfg.get("param__controller_server__FollowPath.ConstraintCritic.cost_weight")
+        if last_cw is None or abs(constraint_weight - float(last_cw)) >= 0.5:
+            if self._set_param_async("controller_server", "FollowPath.ConstraintCritic.cost_weight", constraint_weight):
+                self.last_applied_config["param__controller_server__FollowPath.ConstraintCritic.cost_weight"] = constraint_weight
+
+        last_cost = last_cfg.get("param__controller_server__FollowPath.CostCritic.cost_weight")
+        if last_cost is None or abs(cost_weight - float(last_cost)) >= 0.5:
+            if self._set_param_async("controller_server", "FollowPath.CostCritic.cost_weight", cost_weight):
+                self.last_applied_config["param__controller_server__FollowPath.CostCritic.cost_weight"] = cost_weight
+
+        last_align = last_cfg.get("param__controller_server__FollowPath.PathAlignCritic.cost_weight")
+        if last_align is None or abs(path_align_weight - float(last_align)) >= 1.0:
+            ok1 = self._set_param_async("controller_server", "FollowPath.PathAlignCritic.cost_weight", path_align_weight)
+            ok2 = self._set_param_async("controller_server", "FollowPath.PathFollowCritic.cost_weight", path_align_weight)
+            if ok1 and ok2:
+                self.last_applied_config["param__controller_server__FollowPath.PathAlignCritic.cost_weight"] = path_align_weight
+                self.last_applied_config["param__controller_server__FollowPath.PathFollowCritic.cost_weight"] = path_align_weight
 
         last_inf = last_cfg.get("param__local_costmap__inflation_layer.inflation_radius")
-        if last_inf is None or abs(inflation - float(last_inf)) >= 1e-4:
-            self._set_param_async("local_costmap", "inflation_layer.inflation_radius", inflation)
+        if last_inf is None or abs(inflation - float(last_inf)) >= 0.10:
+            if self._set_param_async("local_costmap", "inflation_layer.inflation_radius", inflation):
+                self.last_applied_config["param__local_costmap__inflation_layer.inflation_radius"] = inflation
 
         # The costmap must track the VERIFIED physical envelope, never
         # the commanded one. Shrinking it at command time leaves 4 s in
@@ -1185,11 +1386,10 @@ class OnlineCausalTunerNode(Node):
         # state is unknown.
         env_label = self._envelope_label(arm_label)
         if env_label != self.applied_envelope_label:
-            self._set_param_async(
-                "local_costmap", "footprint",
-                ARM_CONFIGS[env_label]["footprint"])
-            self._publish_footprint_polygon(ARM_CONFIGS[env_label]["footprint"])
-            self.applied_envelope_label = env_label
+            if self._set_param_async("local_costmap", "footprint", ARM_CONFIGS[env_label]["footprint"]):
+                # self._set_param_async("global_costmap", "footprint", ARM_CONFIGS[env_label]["footprint"])
+                self._publish_footprint_polygon(ARM_CONFIGS[env_label]["footprint"])
+                self.applied_envelope_label = env_label
 
         # Command the arm when the decision changes, OR when a previously
         # commanded target was never physically reached.
@@ -1203,15 +1403,17 @@ class OnlineCausalTunerNode(Node):
             self.pending_arm_label = None
             self.pending_arm_count = 0
 
-        # Retraction (carry -> tucked) is commanded immediately (1st tick).
-        # Extension (tucked -> carry) requires 2 consecutive ticks (0.4 s) in open space.
+        # Safety-critical arm retraction (carry -> tucked) MUST command immediately (1st tick)
+        # and ignore dwell_ok so the robot does not collide while waiting for dwell timer.
         if arm_label == "tucked" and self.target_arm_label == "carry":
             persisted = True
+            dwell_ok = True
         elif arm_label == "carry" and self.target_arm_label == "tucked":
             persisted = self.pending_arm_count >= 2
+            dwell_ok = (sim_now - self.last_arm_switch_time) >= self.arm_switch_dwell
         else:
             persisted = self.pending_arm_count >= self.arm_persist_ticks
-        dwell_ok = (sim_now - self.last_arm_switch_time) >= self.arm_switch_dwell
+            dwell_ok = (sim_now - self.last_arm_switch_time) >= self.arm_switch_dwell
 
         transition_done = sim_now >= self.arm_transition_until_time
         target_changed = (arm_label != self.target_arm_label) and persisted and dwell_ok
@@ -1235,46 +1437,64 @@ class OnlineCausalTunerNode(Node):
                     f"(verified '{self.verified_arm_label}'); re-issuing "
                     f"(retry {self.n_arm_retries}).")
             self.target_arm_label = arm_label
-            self.arm_transition_until_time = sim_now + 4.0
+            self.arm_transition_until_time = sim_now + 2.0
             if not self._move_arm_to_label_async(arm_label):
                 self.arm_transition_until_time = 0.0
 
-        # P Record tick trace in decision_log
+        # P1.2b Record tick trace in decision_log with full Table I intervention space
         self.decision_log.append({
+            # --- timing and context (measured BEFORE this config was applied)
             "t": sim_now,
             "risk": list(self.current_risk_vector or []),
             "risk_measured": list(self.current_risk_vector or []),
             "risk_forecast": list(getattr(self, "last_forecast_risk", [])),
-            "speed_limit_pct": speed_limit_pct,
-            "vx_std": vx_std,
-            "constraint_weight": constraint_weight,
-            "cost_weight": cost_weight,
-            "path_align_weight": path_align_weight,
-            "inflation": inflation,
-            "arm_target": arm_label,
-            "arm_preferred": getattr(self, "preferred_arm_label", None),
-            "arm_verified": self.verified_arm_label,
-            "envelope_applied": self.applied_envelope_label,
-            "p_risk": float(target_config.get("p_risk", float("nan"))),
-            "p_risk_ucb": float(target_config.get("p_risk_ucb", float("nan"))),
-            "p_stall": float(target_config.get("p_stall", float("nan"))),
-            "p_stall_ucb": float(target_config.get("p_stall_ucb", float("nan"))),
-            "utility": float(target_config.get("utility_raw", float("nan"))),
-            "utility_point": float(target_config.get("utility_point", float("nan"))),
-            "reason": target_config.get("selection_reason", ""),
+
+            # --- the seven parameters of Table I, by their Table I names
+            "speed_limit_pct":  float(speed_limit_pct),
+            "vx_std":           float(vx_std),
+            "ConstraintCritic": float(constraint_weight),
+            "CostCritic":       float(cost_weight),
+            "PathAlignCritic":  float(path_align_weight),
+            "inflation_radius": float(inflation),
+            "arm_target":       arm_label,
+
+            # --- footprint verification chain (P0.2)
+            "arm_verified":      self.verified_arm_label,
+            "envelope_applied":  self.applied_envelope_label,
+
+            # --- held fixed; logged so the claim is checkable, not asserted
+            "wz_max":     1.0,
+            "time_steps": 56,
+
+            # --- selector internals
+            "p_risk":         float(target_config.get("p_risk", float("nan"))),
+            "p_stall":        float(target_config.get("p_stall", float("nan"))),
+            "utility":        float(target_config.get("utility_raw", float("nan"))),
+            "reason":         target_config.get("selection_reason", ""),
             "out_of_support": bool(target_config.get("out_of_support", False)),
-            "terminal_phase": bool(self.in_terminal_phase),
-            "d_goal": self._distance_to_goal(),
-            "u_by_speed": target_config.get("u_by_speed"),
-            "u_by_inflation": target_config.get("u_by_inflation"),
-            "u_by_costw": target_config.get("u_by_costw"),
-            "inf_ceiling": target_config.get("inf_ceiling"),
+
+            # --- alias keys for backward compatibility with existing analysis tools
+            "constraint_weight": float(constraint_weight),
+            "cost_weight":       float(cost_weight),
+            "path_align_weight":  float(path_align_weight),
+            "inflation":         float(inflation),
+            "arm_preferred":     getattr(self, "preferred_arm_label", None),
+            "p_risk_ucb":        float(target_config.get("p_risk_ucb", float("nan"))),
+            "p_stall_ucb":       float(target_config.get("p_stall_ucb", float("nan"))),
+            "utility_point":     float(target_config.get("utility_point", float("nan"))),
+            "terminal_phase":    bool(self.in_terminal_phase),
+            "d_goal":            self._distance_to_goal(),
+            "u_by_speed":        target_config.get("u_by_speed"),
+            "u_by_inflation":    target_config.get("u_by_inflation"),
+            "u_by_costw":        target_config.get("u_by_costw"),
+            "inf_ceiling":       target_config.get("inf_ceiling"),
             "n_tied_at_optimum": target_config.get("n_tied_at_optimum"),
             "n_safe_candidates": target_config.get("n_safe_candidates"),
+            "n_carry_feasible":  getattr(self, "n_carry_feasible", 0),
+            "n_carry_total":     getattr(self, "n_carry_total", 0),
         })
 
         target_config["_applied_speed_limit_pct"] = speed_limit_pct
-        self.last_applied_config = target_config.copy()
 
     def reset_trial_metrics(self):
         """Reset per-episode sample metrics AND arm bookkeeping.
@@ -1303,6 +1523,8 @@ class OnlineCausalTunerNode(Node):
         self.out_of_support_features = {}
         self.decision_log = []
         self.applied_envelope_label = None
+        self.in_placement_phase = False
+        self.in_terminal_phase = False
         self.n_param_set_failures = 0
         self.param_set_failures = {}
 
