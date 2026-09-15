@@ -30,10 +30,10 @@ This package uses pre-trained causal risk, stall, and progress models to solve a
 - **Simulator**: Gazebo 11 / PAL TiAGo Navigation Stack
 
 ### Build Package
-From your ROS 2 workspace root:
+From your ROS 2 workspace root (e.g., `~/ros2_ws` or `~/phd_projects/online_tuner`):
 
 ```bash
-cd ~/phd_projects/online_tuner/src
+cd <your_workspace_root>
 colcon build --packages-select online_causal_tuner
 source install/setup.bash
 ```
@@ -47,7 +47,7 @@ Launch the robot and Nav2 stack in the benchmark environment with the dynamic ob
 
 ```bash
 source /opt/ros/humble/setup.bash
-source ~/phd_projects/online_tuner/src/install/setup.bash
+source <your_workspace_root>/install/setup.bash
 
 ros2 launch gazebo_simulation gazebo_with_navigation.launch.py world_name:=causal_benchmark_3_dynamic
 ```
@@ -62,7 +62,7 @@ Obstacle waits off-path and slides across to block the corridor when the robot a
 
 ```bash
 source /opt/ros/humble/setup.bash
-source ~/phd_projects/online_tuner/src/install/setup.bash
+source <your_workspace_root>/install/setup.bash
 
 ros2 run online_causal_tuner dynamic_obstacle_controller
 ```
@@ -72,7 +72,7 @@ Obstacle moves back and forth across the corridor continuously from trial start:
 
 ```bash
 source /opt/ros/humble/setup.bash
-source ~/phd_projects/online_tuner/src/install/setup.bash
+source <your_workspace_root>/install/setup.bash
 
 ros2 run online_causal_tuner dynamic_obstacle_controller --ros-args -p mode:=oscillating
 ```
@@ -85,7 +85,7 @@ In a third terminal, launch the online tuner node to dynamically adapt parameter
 #### Active Tuning Mode (Updates Nav2 & Arm Posture Live)
 ```bash
 source /opt/ros/humble/setup.bash
-source ~/phd_projects/online_tuner/src/install/setup.bash
+source <your_workspace_root>/install/setup.bash
 
 ros2 run online_causal_tuner online_tuner_node --ros-args -p dry_run:=false
 ```
@@ -93,7 +93,7 @@ ros2 run online_causal_tuner online_tuner_node --ros-args -p dry_run:=false
 #### Dry-Run Mode (Console Logging Only)
 ```bash
 source /opt/ros/humble/setup.bash
-source ~/phd_projects/online_tuner/src/install/setup.bash
+source <your_workspace_root>/install/setup.bash
 
 ros2 run online_causal_tuner online_tuner_node --ros-args -p dry_run:=true
 ```
@@ -109,7 +109,7 @@ You can run automated closed-loop evaluation trials across 30 seed-42 benchmark 
 python3 analysis/run_campaign_b_benchmark.py \
   --strategy "Online Causal (Ours)" \
   --num-episodes 30 \
-  --map-yaml ~/phd_projects/online_tuner/src/gazebo_simulation/maps/causal_benchmark_3_dynamic.yaml \
+  --map-yaml <your_workspace_root>/src/gazebo_simulation/maps/causal_benchmark_3_dynamic.yaml \
   --master-csv evaluation_results/causal_benchmark_3/dynamic_test/campaign_b_world3_dynamic_test_results.csv
 ```
 
@@ -120,7 +120,7 @@ python3 analysis/run_campaign_b_benchmark.py \
   --strategy "CURE (Carry)" \
   --arm-pose carry \
   --num-episodes 30 \
-  --map-yaml ~/phd_projects/online_tuner/src/gazebo_simulation/maps/causal_benchmark_3_dynamic.yaml \
+  --map-yaml <your_workspace_root>/src/gazebo_simulation/maps/causal_benchmark_3_dynamic.yaml \
   --master-csv evaluation_results/causal_benchmark_3/dynamic_test/campaign_b_world3_dynamic_test_results.csv
 
 # Default Nav2 Strategy (Carry Arm Pose)
@@ -128,7 +128,7 @@ python3 analysis/run_campaign_b_benchmark.py \
   --strategy "Nav2 Default" \
   --arm-pose carry \
   --num-episodes 30 \
-  --map-yaml ~/phd_projects/online_tuner/src/gazebo_simulation/maps/causal_benchmark_3_dynamic.yaml \
+  --map-yaml <your_workspace_root>/src/gazebo_simulation/maps/causal_benchmark_3_dynamic.yaml \
   --master-csv evaluation_results/causal_benchmark_3/dynamic_test/campaign_b_world3_dynamic_test_results.csv
 ```
 
