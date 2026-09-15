@@ -40,9 +40,14 @@ import rclpy
 from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
 
-sys.path.insert(0, "/home/forough/phd_projects/online_tuner/src")
-sys.path.insert(0, "/home/forough/phd_projects/online_tuner/src/rct_data_collector")
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_CURR_DIR = os.path.dirname(os.path.abspath(__file__))
+_PKG_DIR = os.path.dirname(_CURR_DIR)
+_SRC_DIR = os.path.dirname(_PKG_DIR)
+_WS_DIR = os.path.dirname(_SRC_DIR)
+
+sys.path.insert(0, _SRC_DIR)
+sys.path.insert(0, os.path.join(_SRC_DIR, "rct_data_collector"))
+sys.path.insert(0, _PKG_DIR)
 from online_causal_tuner.online_tuner_node import (
     OnlineCausalTunerNode,
     ARM_CONFIGS,
@@ -80,8 +85,8 @@ STATIC_BEST_FIXED_CONFIG = {
     },
 }
 
-CURE_TUCKED_YAML = "/home/forough/phd_projects/online_tuner/baselines/cure/cure_config_tucked.yaml"
-CURE_CARRY_YAML = "/home/forough/phd_projects/online_tuner/baselines/cure/cure_config_carry.yaml"
+CURE_TUCKED_YAML = os.path.join(_WS_DIR, "baselines", "cure", "cure_config_tucked.yaml")
+CURE_CARRY_YAML = os.path.join(_WS_DIR, "baselines", "cure", "cure_config_carry.yaml")
 
 ALL_STRATEGIES_MAP = {
     "Nav2 Default": {
@@ -688,10 +693,10 @@ def run_benchmark_strategy(
 
 
 def main():
-    default_map = "/home/forough/phd_projects/online_tuner/src/gazebo_simulation/maps/causal_benchmark_3.yaml"
-    default_pool = "/home/forough/phd_projects/online_tuner/src/online_causal_tuner/evaluation_results/pose_pool_30_trials_world3.json"
-    default_master_csv = "/home/forough/phd_projects/online_tuner/src/online_causal_tuner/evaluation_results/causal_benchmark_3/campaign_b_world3_evaluation_results.csv"
-    default_model = "/home/forough/phd_projects/online_tuner/src/online_causal_tuner/models/causal_tuner_models.pkl"
+    default_map = os.path.join(_SRC_DIR, "gazebo_simulation", "maps", "causal_benchmark_3.yaml")
+    default_pool = os.path.join(_PKG_DIR, "evaluation_results", "pose_pool_30_trials_world3.json")
+    default_master_csv = os.path.join(_PKG_DIR, "evaluation_results", "causal_benchmark_3", "campaign_b_world3_evaluation_results.csv")
+    default_model = os.path.join(_PKG_DIR, "models", "causal_tuner_models.pkl")
 
     parser = argparse.ArgumentParser(description="Campaign B Master Benchmark Runner")
     parser.add_argument("--strategy", type=str, default="all", choices=[

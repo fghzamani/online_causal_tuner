@@ -1,6 +1,6 @@
 online_causal_tuner:
   ros__parameters:
-    model_path: "/home/forough/phd_projects/online_tuner/src/online_causal_tuner/models/causal_tuner_models.pkl"
+    model_path: "models/causal_tuner_models.pkl"
 
     # DR-optimal policy tree. "bounded_argmax" is the mu-hat-greedy ablation:
     # V_DR 2.376 vs 2.909, and 145 ms/tick vs 0.05 ms/tick.
@@ -20,7 +20,7 @@ online_causal_tuner:
 
     # A(R) constants are estimated by analysis/calibrate_envelope.py.
     # The values below are NOT used unless envelope_constants_path is empty.
-    envelope_constants_path: "/home/forough/phd_projects/online_tuner/src/online_causal_tuner/models/envelope_constants.json"
+    envelope_constants_path: "models/envelope_constants.json"
 
     # fallbacks only, and a warning is logged if they are used
     clearance_margin_m: 0.10

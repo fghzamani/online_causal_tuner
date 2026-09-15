@@ -30,7 +30,7 @@ This package uses pre-trained causal risk, stall, and progress models to solve a
 - **Simulator**: Gazebo 11 / PAL TiAGo Navigation Stack
 
 ### Build Package
-From your ROS 2 workspace root (e.g., `~/ros2_ws` or `~/phd_projects/online_tuner`):
+From your ROS 2 workspace root (e.g., `~/ros2_ws`):
 
 ```bash
 cd <your_workspace_root>

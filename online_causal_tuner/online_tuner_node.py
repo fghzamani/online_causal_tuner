@@ -130,14 +130,12 @@ class OnlineCausalTunerNode(Node):
         super().__init__("online_causal_tuner")
         OnlineCausalTunerNode._instance = self
 
-        # Gate A1: Declare ROS parameters matching single YAML source of truth
-        self.declare_parameter("model_path", "/home/forough/phd_projects/online_tuner/src/online_causal_tuner/models/causal_tuner_models.pkl")
-        default_env_json = "/home/forough/phd_projects/online_tuner/src/online_causal_tuner/models/envelope_constants.json"
-        if not os.path.exists(default_env_json):
-            pkg_env_json = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models", "envelope_constants.json")
-            if os.path.exists(pkg_env_json):
-                default_env_json = pkg_env_json
-        self.declare_parameter("envelope_constants_path", default_env_json if os.path.exists(default_env_json) else "")
+        pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        default_model_pkl = os.path.join(pkg_dir, "models", "causal_tuner_models.pkl")
+        default_env_json = os.path.join(pkg_dir, "models", "envelope_constants.json")
+
+        self.declare_parameter("model_path", default_model_pkl)
+        self.declare_parameter("envelope_constants_path", default_env_json)
         self.declare_parameter("risk_threshold_p_max", 0.20)
         self.declare_parameter("risk_penalty_lambda", 10.0)
         self.declare_parameter("stall_penalty_mu", 2.0)
