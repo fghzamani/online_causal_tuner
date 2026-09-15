@@ -40,6 +40,26 @@ source install/setup.bash
 
 ---
 
+## Offline Model Training (Optional)
+
+Pre-trained models are included under `models/causal_tuner_models.pkl`. If you wish to re-train the causal safety, stall, and progress models (along with the $B = 50$ bootstrap ensemble for confidence bounds) from a probe dataset:
+
+```bash
+# Using ROS 2 run:
+ros2 run online_causal_tuner train_causal_models \
+  --data-path /path/to/probe_dataset.csv \
+  --output-dir <your_workspace_root>/src/online_causal_tuner/models
+
+# Or directly with Python:
+python3 online_causal_tuner/train_causal_models.py \
+  --data-path /path/to/probe_dataset.csv \
+  --output-dir models/
+```
+
+This outputs the pickled model artifact `models/causal_tuner_models.pkl`, which `online_tuner_node` automatically loads at startup.
+
+---
+
 ## Quick Start Guide
 
 ### Step 1: Launch Gazebo Simulation with Navigation Stack
