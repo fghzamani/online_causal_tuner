@@ -1,0 +1,6 @@
+controller_server:
+  FollowPath.CostCritic.cost_weight: 11.225
+  FollowPath.vx_max: 0.616
+  FollowPath.wz_max: 1.246
+local_costmap:
+  inflation_layer.inflation_radius: 0.472

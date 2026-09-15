@@ -1,9 +1,35 @@
-# Default configuration for Online Causal Tuner node
 online_causal_tuner:
   ros__parameters:
-    model_path: "./models/causal_tuner_models.pkl"
-    risk_threshold_p_max: 0.15
-    epsilon_exploration: 0.05
-    tuning_rate_hz: 1.0
-    n_candidate_samples: 100
-    dry_run: true
+    model_path: "models/causal_tuner_models.pkl"
+
+    # DR-optimal policy tree. "bounded_argmax" is the mu-hat-greedy ablation:
+    # V_DR 2.376 vs 2.909, and 145 ms/tick vs 0.05 ms/tick.
+    selection_mode: "enumerate"
+
+    # MUST equal artifact["objective_weights"] = {risk_lambda: 10.0,
+    # stall_mu: 2.0, payload_omega: 0.5}, or the tree optimizes a different
+    # objective than the node scores. The node refuses to load on mismatch.
+    risk_penalty_lambda: 10.0
+    stall_penalty_mu: 2.0
+    payload_value_omega: 0.8333333333333334
+    risk_threshold_p_max: 0.20
+
+    # hysteresis, as a fraction of the progress ceiling
+    utility_deadband_frac: 0.045
+    arm_switch_cost_frac: 0.055
+
+    # A(R) constants are estimated by analysis/calibrate_envelope.py.
+    # The values below are NOT used unless envelope_constants_path is empty.
+    envelope_constants_path: "models/envelope_constants.json"
+
+    # fallbacks only, and a warning is logged if they are used
+    clearance_margin_m: 0.10
+    decel_limit_mps2: 0.55
+    inflation_floor_m: 0.325
+    envelope_hysteresis_m: 0.15
+    lateral_tracking_tau_s: 0.35     # NOT calibrated, see limitations
+
+    tuning_rate_hz: 5.0
+    anticipation_delta_s: 4.0
+    dry_run: false
+    envelope_only: false

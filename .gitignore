@@ -49,3 +49,5 @@ models/*.pkl
 *.pkl
 *.csv
 *.log
+*.zip
+

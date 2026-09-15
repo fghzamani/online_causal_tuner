@@ -26,6 +26,7 @@ setup(
         'console_scripts': [
             'train_causal_models = online_causal_tuner.train_causal_models:main',
             'online_tuner_node = online_causal_tuner.online_tuner_node:main',
+            'dynamic_obstacle_controller = online_causal_tuner.dynamic_obstacle_controller:main',
         ],
     },
 )
