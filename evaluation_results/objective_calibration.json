@@ -1,0 +1,55 @@
+{
+  "p_max_quantiles": {
+    "q50": 0.005,
+    "q75": 0.012,
+    "q90": 0.018,
+    "q95": 0.02,
+    "q99": 0.045,
+    "q100": 0.2047,
+    "recommended_p_max": 0.02
+  },
+  "lambda_sweep": [
+    {
+      "lambda": 0.0,
+      "mean_p_coll": 0.0142,
+      "shift_fraction": 0.0
+    },
+    {
+      "lambda": 10.0,
+      "mean_p_coll": 0.0115,
+      "shift_fraction": 0.28
+    },
+    {
+      "lambda": 20.0,
+      "mean_p_coll": 0.0108,
+      "shift_fraction": 0.45
+    },
+    {
+      "lambda": 40.0,
+      "mean_p_coll": 0.0102,
+      "shift_fraction": 0.52
+    }
+  ],
+  "mu_sweep": [
+    {
+      "mu": 0.0,
+      "carry_fraction": 0.66,
+      "inflation_floor_frac": 0.88
+    },
+    {
+      "mu": 1.0,
+      "carry_fraction": 0.45,
+      "inflation_floor_frac": 0.88
+    },
+    {
+      "mu": 2.0,
+      "carry_fraction": 0.28,
+      "inflation_floor_frac": 0.88
+    },
+    {
+      "mu": 5.0,
+      "carry_fraction": 0.18,
+      "inflation_floor_frac": 0.88
+    }
+  ]
+}

@@ -1,0 +1,59 @@
+{
+  "constants": {
+    "decel_limit_mps2": {
+      "value": 0.5355,
+      "estimator": "q0.001 linear deceleration",
+      "quantile": 0.001,
+      "n_samples": 1,
+      "ci95": [
+        0.5301,
+        0.5409
+      ]
+    },
+    "envelope_hysteresis_m": {
+      "value": 0.1538,
+      "estimator": "q0.95 r_width variation noise",
+      "quantile": 0.95,
+      "n_samples": 1,
+      "ci95": [
+        0.1507,
+        0.1569
+      ]
+    },
+    "clearance_margin_m": {
+      "value": 0.1063,
+      "estimator": "q0.05 obstacle clearance margin",
+      "quantile": 0.05,
+      "n_samples": 1,
+      "ci95": [
+        0.101,
+        0.1116
+      ]
+    },
+    "inflation_floor_m": {
+      "value": 0.325,
+      "estimator": "derived tucked circumscribed radius",
+      "quantile": null,
+      "n_samples": 0,
+      "ci95": [
+        0.325,
+        0.325
+      ]
+    },
+    "lateral_tracking_tau_s": {
+      "value": 0.35,
+      "estimator": "hand-set fallback (not estimable from current logs)",
+      "quantile": null,
+      "n_samples": 0,
+      "ci95": [
+        0.35,
+        0.35
+      ]
+    }
+  },
+  "provenance": {
+    "trials_dir": "/home/forough/phd_projects/online_tuner/src/online_causal_tuner/evaluation_results",
+    "probes_used": 5,
+    "timestamp": "2026-09-08T14:31:47Z"
+  }
+}
