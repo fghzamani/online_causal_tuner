@@ -220,6 +220,19 @@ def arm_footprint_from_joints(pan: float, elbow: float):
     return [[x, y] for x, y in hull]
 
 
+def _fmt_d(d):
+    """Format a distance that may be None.
+
+    Both phase-transition logs formatted d_goal with ":.2f". d_goal becomes None
+    the moment the goal is reached and the action feedback stops -- which is
+    exactly when the placement/terminal flags flip -- so the transition log
+    raised "unsupported format string passed to NoneType.__format__", aborting
+    that tick before _apply_configuration ran and silently costing one tick of
+    control on every transition.
+    """
+    return f"{d:.2f} m" if d is not None else "N/A"
+
+
 ARM_JOINT_TOLERANCE_RAD = 0.15
 # Stop re-issuing the arm goal after this many failed verifications, so a
 # torque-disabled servo is reported once instead of spamming every tick.
@@ -1416,7 +1429,7 @@ class OnlineCausalTunerNode(Node):
             self.in_placement_phase = entering_place
             self.get_logger().info(
                 f"{'ENTER' if entering_place else 'EXIT'} placement phase "
-                f"(d_goal={d_goal:.2f} m)")
+                f"(d_goal={_fmt_d(d_goal)})")
 
         # Schmitt trigger: enter at terminal_radius, leave only past 1.5x it
         if d_goal is None:
@@ -1430,7 +1443,7 @@ class OnlineCausalTunerNode(Node):
             self.in_terminal_phase = entering
             self.get_logger().info(
                 f"{'ENTER' if entering else 'EXIT'} terminal phase "
-                f"(d_goal={d_goal:.2f} m, radius={self.terminal_radius:.2f} m)")
+                f"(d_goal={_fmt_d(d_goal)}, radius={self.terminal_radius:.2f} m)")
 
         r_min = getattr(self, "_last_r_min", 3.0)
         r_width = getattr(self, "_last_r_width", 5.0)
