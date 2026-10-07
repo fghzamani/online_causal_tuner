@@ -74,6 +74,10 @@ RISK_FEATURE_KEYS = [
 PARAM_KEYS = [
     "param__controller_server__speed_limit_pct",
     "param__controller_server__FollowPath.vx_std",
+    # OMNI: lateral velocity sampling std, a real knob for a holonomic base.
+    # Requires retraining the causal models on Mirte data that actually varies
+    # vy_std (the Tiago Campaign A data has no such column).
+    "param__controller_server__FollowPath.vy_std",
     "param__controller_server__FollowPath.ConstraintCritic.cost_weight",
     "param__controller_server__FollowPath.CostCritic.cost_weight",
     "param__controller_server__FollowPath.PathAlignCritic.cost_weight",
@@ -100,8 +104,11 @@ PAYLOAD_OMEGA = RISK_LAMBDA * CARRY_RISK_TOLERANCE / PROGRESS_MEDIAN_M
 # Coarse action set for policy learning and off-policy evaluation.
 POLICY_ACTION_SET = {
     "param__local_costmap__footprint": [0.0, 1.0],               # tucked / carry
-    "param__local_costmap__inflation_layer.inflation_radius": [0.15, 0.30, 0.45, 0.60],
+    # MIRTE: re-ranged for the 0.22 m base (was Tiago's 0.15-0.60).
+    "param__local_costmap__inflation_layer.inflation_radius": [0.10, 0.20, 0.30],
     "param__controller_server__speed_limit_pct": [30.0, 60.0, 90.0],
+    # OMNI: coarse lateral-sampling levels for the enumerated policy.
+    "param__controller_server__FollowPath.vy_std": [0.15, 0.40],
 }
 
 

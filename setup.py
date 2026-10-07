@@ -14,6 +14,11 @@ setup(
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
         (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
+        # Envelope constants / model artifacts. Needed so the node finds them in a
+        # non-symlink install (with --symlink-install __file__ points at the source
+        # tree, so they resolve there anyway).
+        (os.path.join('share', package_name, 'models'),
+            glob('models/*.json') + glob('models/*.pkl')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,

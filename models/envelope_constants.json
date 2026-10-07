@@ -31,13 +31,13 @@
       ]
     },
     "inflation_floor_m": {
-      "value": 0.325,
-      "estimator": "derived tucked circumscribed radius",
+      "value": 0.2,
+      "estimator": "Mirte narrow-corridor floor. Must stay STRICTLY ABOVE the footprint's padded inscribed radius (0.140 + footprint_padding 0.01 = 0.150), or the inflation layer stops marking the band the robot's body occupies and the robot drives into obstacles despite a correct footprint. 0.20 is also the largest value that still leaves a passable channel in the ~0.84m lab corridor. Tiago's 0.325 pinned inflation to 0.25-0.30 and left MPPI no low-cost path; 0.12 and 0.15 were below the inscribed radius and unsafe.",
       "quantile": null,
       "n_samples": 0,
       "ci95": [
-        0.325,
-        0.325
+        0.2,
+        0.2
       ]
     },
     "lateral_tracking_tau_s": {

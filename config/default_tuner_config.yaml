@@ -23,6 +23,19 @@ online_causal_tuner:
     envelope_constants_path: "models/envelope_constants.json"
 
     # fallbacks only, and a warning is logged if they are used
+    # Arm-extension (carry) clearance gates, tuned for the Mirte lab where the
+    # max clearance anywhere in the navigable region is ~0.91 m. The TIAGo
+    # default of 1.20 m made carry unreachable, so the arm never switched.
+    # adopt > retain provides hysteresis against chattering.
+    carry_adopt_r_min: 0.65
+    carry_retain_r_min: 0.50
+    # Every demo run starts with the arm in the carry pose and a matching
+    # footprint, and only adapts once it has a goal and can observe risk.
+    # Without this the envelope tucks the arm on the first tick, before a
+    # goal exists, because tucked allows a higher speed and speed dominates
+    # the envelope-only selection key.
+    startup_carry_hold: true
+
     clearance_margin_m: 0.10
     decel_limit_mps2: 0.55
     inflation_floor_m: 0.325
@@ -32,4 +45,9 @@ online_causal_tuner:
     tuning_rate_hz: 5.0
     anticipation_delta_s: 4.0
     dry_run: false
-    envelope_only: false
+    # DEMO (Mirte): run the physics feasibility envelope only, WITHOUT the causal
+    # model (the Tiago artifact is not valid for the Mirte config space, and
+    # retraining is out of scope for the demo). The tuner still switches
+    # arm/footprint, speed and inflation from the live risk state, just via the
+    # geometric/kinematic envelope A(R) instead of learned effects.
+    envelope_only: true
