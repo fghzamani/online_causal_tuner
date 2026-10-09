@@ -2,12 +2,12 @@ online_causal_tuner:
   ros__parameters:
     model_path: "models/causal_tuner_models.pkl"
 
-    # DR-optimal policy tree. "bounded_argmax" is the mu-hat-greedy ablation:
-    # V_DR 2.376 vs 2.909, and 145 ms/tick vs 0.05 ms/tick.
+    # NOT read by the node: it always enumerates the grid. The DR policy tree
+    # in the artifact is not used at runtime.
     selection_mode: "enumerate"
 
     # MUST equal artifact["objective_weights"] = {risk_lambda: 10.0,
-    # stall_mu: 2.0, payload_omega: 0.5}, or the tree optimizes a different
+    # stall_mu: 2.0, payload_omega: 0.8333}, or the tree optimizes a different
     # objective than the node scores. The node refuses to load on mismatch.
     risk_penalty_lambda: 10.0
     stall_penalty_mu: 2.0
@@ -15,8 +15,9 @@ online_causal_tuner:
     risk_threshold_p_max: 0.20
 
     # hysteresis, as a fraction of the progress ceiling
-    utility_deadband_frac: 0.045
-    arm_switch_cost_frac: 0.055
+    # (node defaults, used by run_campaign_b_benchmark.py and the paper)
+    utility_deadband_frac: 0.025
+    arm_switch_cost_frac: 0.25
 
     # A(R) constants are estimated by analysis/calibrate_envelope.py.
     # The values below are NOT used unless envelope_constants_path is empty.

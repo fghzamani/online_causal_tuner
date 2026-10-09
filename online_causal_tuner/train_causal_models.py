@@ -762,8 +762,10 @@ def main():
     carry_obs = X[:, fp_idx]                      # 1.0 carry, 0.0 tucked
     stall_obs = (y_progress <= STALL_EPS_M).astype(float)
 
-    # Observed utility, same functional form as the runtime objective.
-    U_obs = ((1.0 + PAYLOAD_OMEGA * carry_obs) * np.asarray(y_progress, float)
+    # Observed utility, same functional form as the runtime objective:
+    # additive carry bonus omega * J_max (online_tuner_node._evaluate_utility).
+    j_max = float(progress_support["max"])
+    U_obs = (np.asarray(y_progress, float) + PAYLOAD_OMEGA * carry_obs * j_max
              - RISK_LAMBDA * np.asarray(y_safety, float)
              - STALL_MU * stall_obs)
 
@@ -773,7 +775,7 @@ def main():
         e_sp = np.clip(speed_model.predict(Xa), 0.0, progress_support["max"])
         prog = (1.0 - p_st) * e_sp
         p_sf = safety_model.predict_proba(Xa)[:, 1]
-        return ((1.0 + PAYLOAD_OMEGA * carry) * prog
+        return (prog + PAYLOAD_OMEGA * carry * j_max
                 - RISK_LAMBDA * p_sf
                 - STALL_MU * p_st)
 

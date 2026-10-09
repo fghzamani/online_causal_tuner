@@ -1004,11 +1004,13 @@ class OnlineCausalTunerNode(Node):
             p_stall_point_all = np.zeros(len(X_arr))
 
         if hasattr(self.speed_model, "predict"):
-            e_speed_point_all = np.asarray(np.clip(self.speed_model.predict(X_arr) * self.anticipation_delta, 0.0, max_prog_support))
+            # The speed head already predicts metres over the probe horizon.
+            e_speed_point_all = np.asarray(np.clip(self.speed_model.predict(X_arr), 0.0, max_prog_support))
         else:
             e_speed_point_all = np.ones(len(X_arr)) * self.anticipation_delta
 
-        j_point_all = e_speed_point_all
+        # Hurdle: E[J] = (1 - P_stall) * E[J | moves]
+        j_point_all = (1.0 - p_stall_point_all) * e_speed_point_all
         if self.use_bounds:
             # Score all feasible candidates using fast vectorized affine matrix multiplications
             top_indices = np.arange(len(candidates_with_eval))
@@ -1028,8 +1030,9 @@ class OnlineCausalTunerNode(Node):
             P_stall = 1.0 / (1.0 + np.exp(-np.clip(Ws @ Z.T + bs[:, None], -30.0, 30.0)))
 
             Ws, bs, _ = self.ens_affine["speed"]
-            E_speed = np.clip((Ws @ Z.T + bs[:, None]) * self.anticipation_delta, 0.0, max_prog_support)
-            J = E_speed
+            E_speed = np.clip(Ws @ Z.T + bs[:, None], 0.0, max_prog_support)
+            # Hurdle per replicate: stall and speed heads come from the same bootstrap draw b.
+            J = (1.0 - P_stall) * E_speed
 
             p_point = P.mean(axis=0)
             p_stall_point = P_stall.mean(axis=0)
@@ -1105,10 +1108,10 @@ class OnlineCausalTunerNode(Node):
                 if last_cfg is not None and self.deadband_margin > 0.0:
                     n_changed = 0
                     for k in (INFLATION_KEY, COST_WEIGHT_KEY, VX_STD_KEY, CONSTRAINT_KEY, PATH_ALIGN_KEY):
-                        last_v = last_cfg.get(f"param__{k}")
+                        last_v = last_cfg.get(k)
                         if last_v is not None and abs(float(c[k]) - float(last_v)) > 1e-4:
                             n_changed += 1
-                    last_spd = last_cfg.get(f"param__{SPEED_LIMIT_KEY}")
+                    last_spd = last_cfg.get(SPEED_LIMIT_KEY)
                     if last_spd is not None and float(c[SPEED_LIMIT_KEY]) < float(last_spd) - 5.0:
                         n_changed += 1
                     if n_changed > 0:
@@ -1128,9 +1131,9 @@ class OnlineCausalTunerNode(Node):
                 matching_last = [
                     c for c in top_candidates
                     if all(
-                        abs(float(c[k]) - float(last_cfg.get(f"param__{k}", c[k]))) < 1e-4
+                        abs(float(c[k]) - float(last_cfg.get(k, c[k]))) < 1e-4
                         for k in (INFLATION_KEY, COST_WEIGHT_KEY, VX_STD_KEY, CONSTRAINT_KEY, PATH_ALIGN_KEY, SPEED_LIMIT_KEY, FOOTPRINT_KEY)
-                        if f"param__{k}" in last_cfg
+                        if k in last_cfg
                     )
                 ]
 
@@ -1139,11 +1142,12 @@ class OnlineCausalTunerNode(Node):
             else:
                 best_row = max(
                     top_candidates,
+                    # Utility decides; the remaining keys only break exact ties.
                     key=lambda c: (
+                        c.get("utility_effective", c["utility_raw"]),
                         float(c.get(SPEED_LIMIT_KEY, 0.0)),
                         -float(c.get(INFLATION_KEY, 1.0)),
                         -float(c.get(COST_WEIGHT_KEY, 100.0)),
-                        c.get("utility_effective", c["utility_raw"]),
                         float(c.get(FOOTPRINT_KEY, 0.0))
                     )
                 ).copy()
